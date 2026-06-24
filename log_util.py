@@ -7,9 +7,8 @@ import io
 import inspect
 import threading
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
-IsWindows = sys.platform == 'win32'
 IsPy38OrHigher = sys.version_info >= (3, 8)
 
 if IsPy38OrHigher:
@@ -158,7 +157,7 @@ try:
         }
         '''
         file_format = '{time:YYYY-MM-DD HH:mm:ss.SSS} {level} T{thread} L{line} {function}: {message}'
-        if log_to_stdout:
+        if log_to_stdout and sys.stdout:
             console_format = ('<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> <lvl>{level}</lvl> '
                 '{file},{line} <light-blue>T{thread}</light-blue> <light-cyan>{function}</light-cyan>'
                 ': <lvl>{message}</lvl>')
@@ -235,7 +234,8 @@ except ImportError:
             pass
         else:
             for handler in logger.handlers[:]:
-                logger.removeHandler(handler)
+                if getattr(handler, 'stream', None) in (sys.stdout, sys.stderr):
+                    logger.removeHandler(handler)
         logger.addHandler(file_handler)
 
 
@@ -279,6 +279,7 @@ def remove_color_of_shell_text(stdout: str) -> str:
 
 
 def printx(*values, prefix: Any = '', print_id: bool = False, sep: str = ' ', end: str = None, caller: bool = True, flush: bool = False) -> None:
+    '''values must be variables that have name, like: name = value, not literal or expression like: 1 + 2, etc.'''
     now = datetime.now()
     if caller:
         frame = sys._getframe(1)
@@ -325,7 +326,7 @@ def printx(*values, prefix: Any = '', print_id: bool = False, sep: str = ' ', en
     print(timestr, "\n  ".join(output_parts), sep=sep, end=end, flush=flush)
 
 
-def log(msg: Any = '', sep: str = ' ', end: str = None, caller: bool = True, flush: bool = False, file: io.FileIO = None) -> None:
+def log(msg: Any = '', sep: str = ' ', end: Optional[str] = None, caller: bool = True, flush: bool = False, file: Optional[io.FileIO] = None) -> None:
     '''console log'''
     now = datetime.now()
     if caller:
@@ -356,6 +357,6 @@ if __name__ == '__main__':
         logger.error('hello world')
         logger.critical('hello world')
 
-    config_logger(logger, log_to_stdout=True)
-    logger.debug('hello world')
+    config_logger(logger, log_to_stdout=True, log_dir='logs', log_file='test.log')
+    logger.info('hello world')
     log_test()
