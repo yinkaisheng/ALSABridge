@@ -1,5 +1,7 @@
 #include <cstdio>
 #include <cmath>
+#include <cstring>
+#include <cctype>
 #include <memory>
 #include <thread>
 #include <algorithm>
@@ -27,6 +29,222 @@ DLL_EXPORT int enumerateAlsaPlaybackDevices(AlsaEnumCallback callback, void* use
     return enumerateAlsaSoundcards(false, callback, user);
 }
 
+static int writeUnavailable(char* out, int outSize, const char* reason)
+{
+    if (!out || outSize <= 0)
+        return 0;
+    std::snprintf(out, (size_t)outSize, "unavailable: %s", reason ? reason : "unknown");
+    return 0;
+}
+
+static void fillResolvedDeviceInfo(
+    snd_pcm_t* handle,
+    char* resolvesBuf, size_t resolvesSize,
+    char* cardBuf, size_t cardSize,
+    char* typeBuf, size_t typeSize)
+{
+    const char* typeName = snd_pcm_type_name(snd_pcm_type(handle));
+    std::snprintf(typeBuf, typeSize, "%s", typeName ? typeName : "unknown");
+
+    snd_pcm_info_t* pcmInfo = nullptr;
+    snd_pcm_info_alloca(&pcmInfo);
+    int err = snd_pcm_info(handle, pcmInfo);
+    if (err < 0)
+    {
+        const char* pcmName = snd_pcm_name(handle);
+        std::snprintf(resolvesBuf, resolvesSize, "%s (info unavailable)", pcmName ? pcmName : "?");
+        std::snprintf(cardBuf, cardSize, "(none)");
+        return;
+    }
+
+    int card = snd_pcm_info_get_card(pcmInfo);
+    unsigned int device = snd_pcm_info_get_device(pcmInfo);
+    unsigned int subdevice = snd_pcm_info_get_subdevice(pcmInfo);
+    unsigned int subdevices = snd_pcm_info_get_subdevices_count(pcmInfo);
+    const char* pcmId = snd_pcm_info_get_id(pcmInfo);
+    const char* pcmName = snd_pcm_info_get_name(pcmInfo);
+
+    if (card < 0)
+    {
+        const char* openName = snd_pcm_name(handle);
+        std::snprintf(
+            resolvesBuf, resolvesSize, "%s (logical, no hw card)",
+            openName ? openName : (pcmId ? pcmId : "?"));
+        std::snprintf(
+            cardBuf, cardSize, "(none)%s%s",
+            pcmName && pcmName[0] ? ", " : "",
+            pcmName && pcmName[0] ? pcmName : "");
+        return;
+    }
+
+    char hwCard[32];
+    std::snprintf(hwCard, sizeof(hwCard), "hw:%d", card);
+
+    char cardIdBuf[64] = {};
+    char cardNameBuf[128] = {};
+    snd_ctl_t* ctl = nullptr;
+    if (snd_ctl_open(&ctl, hwCard, SND_CTL_NONBLOCK) >= 0)
+    {
+        snd_ctl_card_info_t* cardInfo = nullptr;
+        snd_ctl_card_info_alloca(&cardInfo);
+        if (snd_ctl_card_info(ctl, cardInfo) >= 0)
+        {
+            const char* cardId = snd_ctl_card_info_get_id(cardInfo);
+            const char* cardName = snd_ctl_card_info_get_name(cardInfo);
+            if (cardId && cardId[0])
+                std::snprintf(cardIdBuf, sizeof(cardIdBuf), "%s", cardId);
+            if (cardName && cardName[0])
+                std::snprintf(cardNameBuf, sizeof(cardNameBuf), "%s", cardName);
+        }
+        snd_ctl_close(ctl);
+    }
+
+    if (cardIdBuf[0])
+    {
+        if (subdevices > 1)
+            std::snprintf(resolvesBuf, resolvesSize, "hw:%s,%u,%u", cardIdBuf, device, subdevice);
+        else
+            std::snprintf(resolvesBuf, resolvesSize, "hw:%s,%u", cardIdBuf, device);
+    }
+    else
+    {
+        if (subdevices > 1)
+            std::snprintf(resolvesBuf, resolvesSize, "hw:%d,%u,%u", card, device, subdevice);
+        else
+            std::snprintf(resolvesBuf, resolvesSize, "hw:%d,%u", card, device);
+    }
+
+    const char* displayName = cardNameBuf[0] ? cardNameBuf
+        : (pcmName && pcmName[0] ? pcmName : "unknown");
+    std::snprintf(cardBuf, cardSize, "%s (%s)", hwCard, displayName);
+}
+
+DLL_EXPORT int queryAlsaDeviceHwParams(const char* deviceId, int isCapture, char* out, int outSize)
+{
+    if (!out || outSize <= 0)
+        return 0;
+    out[0] = '\0';
+    if (!deviceId || !deviceId[0])
+        return writeUnavailable(out, outSize, "empty device id");
+
+    snd_pcm_t* handle = nullptr;
+    snd_pcm_stream_t stream = isCapture ? SND_PCM_STREAM_CAPTURE : SND_PCM_STREAM_PLAYBACK;
+    int err = snd_pcm_open(&handle, deviceId, stream, SND_PCM_NONBLOCK);
+    if (err < 0)
+        return writeUnavailable(out, outSize, snd_strerror(err));
+
+    char resolvesBuf[128] = {};
+    char cardBuf[128] = {};
+    char typeBuf[64] = {};
+    fillResolvedDeviceInfo(
+        handle,
+        resolvesBuf, sizeof(resolvesBuf),
+        cardBuf, sizeof(cardBuf),
+        typeBuf, sizeof(typeBuf));
+
+    snd_pcm_hw_params_t* hwParams = nullptr;
+    snd_pcm_hw_params_alloca(&hwParams);
+    err = snd_pcm_hw_params_any(handle, hwParams);
+    if (err < 0)
+    {
+        const char* reason = snd_strerror(err);
+        snd_pcm_close(handle);
+        return writeUnavailable(out, outSize, reason);
+    }
+
+    unsigned int chMin = 0, chMax = 0;
+    err = snd_pcm_hw_params_get_channels_min(hwParams, &chMin);
+    if (err < 0)
+    {
+        const char* reason = snd_strerror(err);
+        snd_pcm_close(handle);
+        return writeUnavailable(out, outSize, reason);
+    }
+    err = snd_pcm_hw_params_get_channels_max(hwParams, &chMax);
+    if (err < 0)
+    {
+        const char* reason = snd_strerror(err);
+        snd_pcm_close(handle);
+        return writeUnavailable(out, outSize, reason);
+    }
+
+    unsigned int rateMin = 0, rateMax = 0;
+    err = snd_pcm_hw_params_get_rate_min(hwParams, &rateMin, nullptr);
+    if (err < 0)
+    {
+        const char* reason = snd_strerror(err);
+        snd_pcm_close(handle);
+        return writeUnavailable(out, outSize, reason);
+    }
+    err = snd_pcm_hw_params_get_rate_max(hwParams, &rateMax, nullptr);
+    if (err < 0)
+    {
+        const char* reason = snd_strerror(err);
+        snd_pcm_close(handle);
+        return writeUnavailable(out, outSize, reason);
+    }
+
+    static const snd_pcm_format_t kFormats[] = {
+        SND_PCM_FORMAT_S8,
+        SND_PCM_FORMAT_U8,
+        SND_PCM_FORMAT_S16_LE,
+        SND_PCM_FORMAT_S16_BE,
+        SND_PCM_FORMAT_S24_LE,
+        SND_PCM_FORMAT_S24_3LE,
+        SND_PCM_FORMAT_S32_LE,
+        SND_PCM_FORMAT_FLOAT_LE,
+    };
+
+    char formatsBuf[256] = {};
+    size_t formatsLen = 0;
+    for (snd_pcm_format_t fmt : kFormats)
+    {
+        if (snd_pcm_hw_params_test_format(handle, hwParams, fmt) != 0)
+            continue;
+        const char* name = snd_pcm_format_name(fmt);
+        if (!name)
+            continue;
+        int n = std::snprintf(
+            formatsBuf + formatsLen,
+            sizeof(formatsBuf) - formatsLen,
+            "%s%s",
+            formatsLen ? ", " : "",
+            name);
+        if (n < 0 || (size_t)n >= sizeof(formatsBuf) - formatsLen)
+            break;
+        formatsLen += (size_t)n;
+    }
+    if (formatsLen == 0)
+        std::snprintf(formatsBuf, sizeof(formatsBuf), "(none probed)");
+
+    char channelsBuf[32];
+    if (chMin == chMax)
+        std::snprintf(channelsBuf, sizeof(channelsBuf), "%u", chMin);
+    else
+        std::snprintf(channelsBuf, sizeof(channelsBuf), "%u-%u", chMin, chMax);
+
+    char ratesBuf[48];
+    if (rateMin == rateMax)
+        std::snprintf(ratesBuf, sizeof(ratesBuf), "%u", rateMin);
+    else
+        std::snprintf(ratesBuf, sizeof(ratesBuf), "%u-%u", rateMin, rateMax);
+
+    int written = std::snprintf(
+        out, (size_t)outSize,
+        "resolves: %s\ncard    : %s\ntype    : %s\nchannels: %s\nrates   : %s\nformats : %s",
+        resolvesBuf, cardBuf, typeBuf, channelsBuf, ratesBuf, formatsBuf);
+    snd_pcm_close(handle);
+    if (written < 0)
+        return writeUnavailable(out, outSize, "format failed");
+    return 1;
+}
+
+#define REQUIRE_HANDLE(handle) \
+    do { \
+        if (!(handle)) \
+            return 0; \
+    } while (0)
+
 DLL_EXPORT size_t AlsaCaptureDevice_create()
 {
     AlsaDevice* alsa = new AlsaCaptureDevice();
@@ -47,54 +265,64 @@ DLL_EXPORT void AlsaDevice_release(size_t handle)
 
 DLL_EXPORT int AlsaDevice_open(size_t handle, const char* deviceId)
 {
+    REQUIRE_HANDLE(handle);
     AlsaDevice* alsa = (AlsaDevice*)handle;
     return alsa->open(deviceId);
 }
 
 DLL_EXPORT int AlsaDevice_setPeriod(size_t handle, uint32_t periodCount, uint32_t periodTime)
 {
+    REQUIRE_HANDLE(handle);
     AlsaDevice* alsa = (AlsaDevice*)handle;
     return alsa->setPeriod(periodCount, periodTime);
 }
 
 DLL_EXPORT int AlsaDevice_setParams(size_t handle, uint32_t sampleRate, uint32_t channels, uint32_t bitsPerSample)
 {
+    REQUIRE_HANDLE(handle);
     AlsaDevice* alsa = (AlsaDevice*)handle;
     return alsa->setParams(sampleRate, channels, bitsPerSample);
 }
 
 DLL_EXPORT int AlsaDevice_start(size_t handle)
 {
+    REQUIRE_HANDLE(handle);
     AlsaDevice* alsa = (AlsaDevice*)handle;
     return alsa->start();
 }
 
 DLL_EXPORT int AlsaDevice_stop(size_t handle)
 {
+    REQUIRE_HANDLE(handle);
     AlsaDevice* alsa = (AlsaDevice*)handle;
     return alsa->stop();
 }
 
 DLL_EXPORT int AlsaDevice_close(size_t handle)
 {
+    REQUIRE_HANDLE(handle);
     AlsaDevice* alsa = (AlsaDevice*)handle;
     return alsa->close();
 }
 
 DLL_EXPORT int AlsaDevice_getVolume(size_t handle, const char* cardId)
 {
+    if (!handle)
+        return -1;
     AlsaDevice* alsa = (AlsaDevice*)handle;
     return alsa->getVolume(cardId);
 }
 
 DLL_EXPORT int AlsaDevice_setVolume(size_t handle, const char* cardId, int volume)
 {
+    REQUIRE_HANDLE(handle);
     AlsaDevice* alsa = (AlsaDevice*)handle;
     return alsa->setVolume(cardId, volume);
 }
 
 DLL_EXPORT int AlsaCaptureDevice_setOutputCallback(size_t handle, AlsaOutputDataCallback callback, void* user)
 {
+    REQUIRE_HANDLE(handle);
     AlsaDevice* alsa = (AlsaDevice*)handle;
     AlsaCaptureDevice* cap = (AlsaCaptureDevice*)alsa;
     return cap->setOutputCallback(callback, user);
@@ -102,6 +330,7 @@ DLL_EXPORT int AlsaCaptureDevice_setOutputCallback(size_t handle, AlsaOutputData
 
 DLL_EXPORT int AlsaCaptureDevice_captureToPcmFile(size_t handle, const char* pcmName, int append)
 {
+    REQUIRE_HANDLE(handle);
     AlsaDevice* alsa = (AlsaDevice*)handle;
     AlsaCaptureDevice* cap = (AlsaCaptureDevice*)alsa;
     return cap->captureToPcmFile(pcmName, (bool)append);
@@ -109,6 +338,7 @@ DLL_EXPORT int AlsaCaptureDevice_captureToPcmFile(size_t handle, const char* pcm
 
 DLL_EXPORT int AlsaPlaybackDevice_setMinCachePeriodCount(size_t handle, uint32_t minCachePeriodCount)
 {
+    REQUIRE_HANDLE(handle);
     AlsaDevice* alsa = (AlsaDevice*)handle;
     AlsaPlaybackDevice* play = (AlsaPlaybackDevice*)alsa;
     return play->setMinCachePeriodCount(minCachePeriodCount);
@@ -116,6 +346,7 @@ DLL_EXPORT int AlsaPlaybackDevice_setMinCachePeriodCount(size_t handle, uint32_t
 
 DLL_EXPORT int AlsaPlaybackDevice_setInputCallback(size_t handle, AlsaInputDataCallback callback, void* user)
 {
+    REQUIRE_HANDLE(handle);
     AlsaDevice* alsa = (AlsaDevice*)handle;
     AlsaPlaybackDevice* play = (AlsaPlaybackDevice*)alsa;
     return play->setInputCallback(callback, user);
@@ -123,6 +354,7 @@ DLL_EXPORT int AlsaPlaybackDevice_setInputCallback(size_t handle, AlsaInputDataC
 
 DLL_EXPORT int AlsaPlaybackDevice_syncStop(size_t handle)
 {
+    REQUIRE_HANDLE(handle);
     AlsaDevice* alsa = (AlsaDevice*)handle;
     AlsaPlaybackDevice* play = (AlsaPlaybackDevice*)alsa;
     return play->syncStop();
@@ -130,6 +362,7 @@ DLL_EXPORT int AlsaPlaybackDevice_syncStop(size_t handle)
 
 DLL_EXPORT int AlsaPlaybackDevice_asyncStop(size_t handle, AlsaPlaybackStoppedCallback callback, void* user)
 {
+    REQUIRE_HANDLE(handle);
     AlsaDevice* alsa = (AlsaDevice*)handle;
     AlsaPlaybackDevice* play = (AlsaPlaybackDevice*)alsa;
     return play->asyncStop(callback, user);
@@ -137,6 +370,7 @@ DLL_EXPORT int AlsaPlaybackDevice_asyncStop(size_t handle, AlsaPlaybackStoppedCa
 
 DLL_EXPORT int AlsaPlaybackDevice_pause(size_t handle)
 {
+    REQUIRE_HANDLE(handle);
     AlsaDevice* alsa = (AlsaDevice*)handle;
     AlsaPlaybackDevice* play = (AlsaPlaybackDevice*)alsa;
     return play->pause();
@@ -144,6 +378,7 @@ DLL_EXPORT int AlsaPlaybackDevice_pause(size_t handle)
 
 DLL_EXPORT int AlsaPlaybackDevice_resume(size_t handle)
 {
+    REQUIRE_HANDLE(handle);
     AlsaDevice* alsa = (AlsaDevice*)handle;
     AlsaPlaybackDevice* play = (AlsaPlaybackDevice*)alsa;
     return play->resume();
@@ -305,7 +540,8 @@ AlsaDevice::AlsaDevice()
 
 AlsaDevice::~AlsaDevice()
 {
-
+    if (_handle)
+        close();
 }
 
 AlsaCaptureDevice::~AlsaCaptureDevice()
@@ -427,9 +663,9 @@ bool AlsaDevice::setParams(uint32_t sampleRate, uint32_t channels, uint32_t bits
     {
         format = SND_PCM_FORMAT_S8;
     }
-    if (bitsPerSample == 16)
+    else if (bitsPerSample == 16)
     {
-        format = SND_PCM_FORMAT_S16;
+        format = SND_PCM_FORMAT_S16_LE;
     }
     else if (bitsPerSample == 24)
     {
@@ -782,7 +1018,9 @@ void AlsaCaptureDevice::handleData(int64_t startTick, int avail, char* buffer, u
         {
             if (avail < 0)
                 avail = 0;  // likely overrun
-            uint32_t cacheMs = avail * _sampleRate / 1000;
+            uint32_t cacheMs = 0;
+            if (_sampleRate > 0)
+                cacheMs = (uint32_t)((int64_t)avail * 1000 / _sampleRate);
             _outputCallback(cacheMs, buffer, num, _userData);
         }
         if (num < sampleCount)
@@ -827,7 +1065,9 @@ void AlsaPlaybackDevice::handleData(int64_t startTick, int avail, char* buffer, 
         avail -= _totalCapacitySamples;
     }*/
     uint32_t cachedSamples = _totalCapacitySamples - avail;
-    uint32_t cacheMs = cachedSamples * 1000 / _sampleRate;
+    uint32_t cacheMs = 0;
+    if (_sampleRate > 0)
+        cacheMs = cachedSamples * 1000 / _sampleRate;
     if (cachedSamples >= _periodCount * sampleCount)
     {
         // buffer is enough
@@ -844,7 +1084,14 @@ void AlsaPlaybackDevice::handleData(int64_t startTick, int avail, char* buffer, 
         cacheMs = delay * 1000 / _sampleRate;
 
         uint32_t gotSamples = sampleCount;
-        _inputCallback(cacheMs, buffer, gotSamples, _userData);
+        _inputCallback(cacheMs, buffer, &gotSamples, _userData);
+        if (gotSamples > sampleCount)
+            gotSamples = sampleCount;
+        if (gotSamples < sampleCount)
+        {
+            size_t frameBytes = (size_t)_channels * _bitsPerSample / 8;
+            memset(buffer + gotSamples * frameBytes, 0, (sampleCount - gotSamples) * frameBytes);
+        }
         _totalHandledSamples += gotSamples;
         //ULOG("write total %u ms", _totalHandledSamples*1000/_sampleRate);
         if (gotSamples == 0)
@@ -1020,136 +1267,164 @@ void AlsaCaptureDevice::closeFile()
     }
 }
 
+static bool nameEqualsIgnoreCase(const char* a, const char* b)
+{
+    if (!a || !b)
+        return false;
+    while (*a && *b)
+    {
+        if (std::tolower((unsigned char)*a) != std::tolower((unsigned char)*b))
+            return false;
+        ++a;
+        ++b;
+    }
+    return *a == *b;
+}
+
+static int mixerControlPriority(const char* name)
+{
+    if (!name)
+        return 100;
+    if (nameEqualsIgnoreCase(name, "Master"))
+        return 0;
+    if (nameEqualsIgnoreCase(name, "PCM"))
+        return 1;
+    if (nameEqualsIgnoreCase(name, "Speaker") || nameEqualsIgnoreCase(name, "Headphone"))
+        return 2;
+    if (nameEqualsIgnoreCase(name, "Capture") || nameEqualsIgnoreCase(name, "Mic"))
+        return 2;
+    return 50;
+}
+
 bool getOrSetVolume(const char* cardId, bool isCaptureDevice, int* getVolume, int* setVolume)
 {
+    if (!cardId || !cardId[0])
+    {
+        ULOG("getOrSetVolume: empty cardId");
+        return false;
+    }
+
     bool ret{};
     int err{};
     snd_mixer_t* handle{};
-    snd_mixer_elem_t* elem{};
+    err = snd_mixer_open(&handle, 0);
+    if (err < 0)
+    {
+        ULOG("snd_mixer_open failed, error=%d(%s)", err, snd_strerror(err));
+        return false;
+    }
+    err = snd_mixer_attach(handle, cardId);
+    if (err < 0)
+    {
+        ULOG("snd_mixer_attach('%s') failed, error=%d(%s)", cardId, err, snd_strerror(err));
+        snd_mixer_close(handle);
+        return false;
+    }
+    err = snd_mixer_selem_register(handle, NULL, NULL);
+    if (err < 0)
+    {
+        ULOG("snd_mixer_selem_register failed, error=%d(%s)", err, snd_strerror(err));
+        snd_mixer_close(handle);
+        return false;
+    }
+    err = snd_mixer_load(handle);
+    if (err < 0)
+    {
+        ULOG("snd_mixer_load failed, error=%d(%s)", err, snd_strerror(err));
+        snd_mixer_close(handle);
+        return false;
+    }
+
+    snd_mixer_elem_t* bestElem = nullptr;
+    int bestPriority = 1000;
     snd_mixer_selem_id_t* sid{};
     snd_mixer_selem_id_alloca(&sid);
 
-    snd_mixer_open(&handle, 0);
-    snd_mixer_attach(handle, cardId);
-    snd_mixer_selem_register(handle, NULL, NULL);
-    snd_mixer_load(handle);
+    for (snd_mixer_elem_t* elem = snd_mixer_first_elem(handle); elem; elem = snd_mixer_elem_next(elem))
+    {
+        snd_mixer_selem_get_id(elem, sid);
+        if (!snd_mixer_selem_is_active(elem))
+            continue;
 
-    for (elem = snd_mixer_first_elem(handle); elem; elem = snd_mixer_elem_next(elem)) {
-		snd_mixer_selem_get_id(elem, sid);
-		if (!snd_mixer_selem_is_active(elem))
-			continue;
-        printf("card: %s\n", cardId);
-		printf("Simple mixer control '%s',%i\n", snd_mixer_selem_id_get_name(sid), snd_mixer_selem_id_get_index(sid));
-        int hasCommonVolume = snd_mixer_selem_has_common_volume(elem);
-        int hasCommonSwitch = snd_mixer_selem_has_common_switch(elem);
-
-        int hasCaptureMono = snd_mixer_selem_has_capture_channel(elem, SND_MIXER_SCHN_MONO);
-        int isCaptureMono = snd_mixer_selem_is_capture_mono(elem);
         int hasCaptureVolume = snd_mixer_selem_has_capture_volume(elem);
-        int hasCaptureSwitch = snd_mixer_selem_has_capture_switch(elem);
-
-        int hasPlaybackMono = snd_mixer_selem_has_playback_channel(elem, SND_MIXER_SCHN_MONO);
-        int isPlaybackMono = snd_mixer_selem_is_playback_mono(elem);
         int hasPlaybackVolume = snd_mixer_selem_has_playback_volume(elem);
-        int hasPlaybackSwitch = snd_mixer_selem_has_playback_switch(elem);
+        int hasCommonVolume = snd_mixer_selem_has_common_volume(elem);
+        bool usable = isCaptureDevice
+            ? (hasCommonVolume || hasCaptureVolume)
+            : (hasCommonVolume || hasPlaybackVolume);
+        if (!usable)
+            continue;
 
-        bool cmono = hasCaptureMono && (isCaptureMono || (!hasCaptureVolume && !hasCaptureSwitch));
-        bool pmono = hasPlaybackMono && (isPlaybackMono || (!hasPlaybackVolume && !hasPlaybackSwitch));
-
-        printf("hasCommonVolume %d, hasCommonSwitch %d\n",
-            hasCommonVolume, hasCommonSwitch);
-        printf("hasCaptureMono %d, isCaptureMono %d, hasCaptureVolume %d, hasCaptureSwitch %d\n, cmono:%d\n",
-            hasCaptureMono, isCaptureMono, hasCaptureVolume, hasCaptureSwitch, cmono);
-        printf("hasPlaybackMono %d, isPlaybackMono %d, hasPlaybackVolume %d, hasPlaybackSwitch %d\n, pmono:%d\n",
-            hasPlaybackMono, isPlaybackMono, hasPlaybackVolume, hasPlaybackSwitch, pmono);
-
-        long cmin, cmax, cvol; int cpercent;
-        long pmin, pmax, pvol; int ppercent;
-        int isOn;
-        if (isCaptureDevice && (hasCommonVolume || hasCaptureVolume))
+        const char* name = snd_mixer_selem_id_get_name(sid);
+        int priority = mixerControlPriority(name);
+        if (priority < bestPriority)
         {
-            err = snd_mixer_selem_get_capture_volume_range(elem, &cmin, &cmax);
+            bestPriority = priority;
+            bestElem = elem;
+        }
+    }
+
+    if (!bestElem)
+    {
+        ULOG("getOrSetVolume: no volume control on card '%s'", cardId);
+        snd_mixer_close(handle);
+        return false;
+    }
+
+    long vmin = 0, vmax = 0, vcur = 0;
+    if (isCaptureDevice)
+        err = snd_mixer_selem_get_capture_volume_range(bestElem, &vmin, &vmax);
+    else
+        err = snd_mixer_selem_get_playback_volume_range(bestElem, &vmin, &vmax);
+    if (err < 0 || vmax <= vmin)
+    {
+        ULOG("getOrSetVolume: invalid volume range on '%s'", cardId);
+        snd_mixer_close(handle);
+        return false;
+    }
+
+    for (int n = 0; n <= SND_MIXER_SCHN_LAST; ++n)
+    {
+        snd_mixer_selem_channel_id_t ch = (snd_mixer_selem_channel_id_t)n;
+        bool hasCh = isCaptureDevice
+            ? snd_mixer_selem_has_capture_channel(bestElem, ch)
+            : snd_mixer_selem_has_playback_channel(bestElem, ch);
+        if (!hasCh)
+            continue;
+
+        if (isCaptureDevice)
+            err = snd_mixer_selem_get_capture_volume(bestElem, ch, &vcur);
+        else
+            err = snd_mixer_selem_get_playback_volume(bestElem, ch, &vcur);
+        if (err < 0)
+            continue;
+
+        int percent = (int)rint((vcur - vmin) * 100.0 / (vmax - vmin));
+        if (getVolume)
+        {
+            *getVolume = percent;
+            ret = true;
+        }
+        if (setVolume && (*setVolume) >= 0 && (*setVolume) <= 100)
+        {
+            long target = vmin + (vmax - vmin) * (*setVolume) / 100;
+            if (isCaptureDevice)
+                err = snd_mixer_selem_set_capture_volume(bestElem, ch, target);
+            else
+                err = snd_mixer_selem_set_playback_volume(bestElem, ch, target);
             if (err == 0)
             {
-                printf("Captuer volume range: [%ld, %ld]\n", cmin, cmax);
-                for (int n=0; n <= 8; ++n)
-                {
-                    snd_mixer_selem_channel_id_t ch = (snd_mixer_selem_channel_id_t)n;
-                    const char* chName = snd_mixer_selem_channel_name(ch);
-                    if (snd_mixer_selem_has_capture_channel(elem, ch))
-                    {
-                        cvol = 0;
-                        isOn = 0;
-                        err = snd_mixer_selem_get_capture_switch(elem, ch, &isOn);
-                        err = snd_mixer_selem_get_capture_volume(elem, ch, &cvol);
-                        if (err == 0)
-                        {
-                            cpercent = (int)rint((cvol-cmin)*100.0/(cmax-cmin));
-                            printf("  %s, volume %ld(%d%%) %s\n",
-                                chName, cvol, cpercent, isOn ? "on" : "off");
-                            if (getVolume)
-                            {
-                                *getVolume = cpercent;
-                                ret = true;
-                            }
-                            if (setVolume && (*setVolume) >= 0 && (*setVolume) <= 100)
-                            {
-                                cvol = cmin + (cmax-cmin) * (*setVolume) / 100;
-                                err = snd_mixer_selem_set_capture_volume(elem, ch, cvol);
-                                if (err == 0)
-                                {
-                                    printf("  set volume to %d%%\n", *setVolume);
-                                    ret = true;
-                                }
-                            }
-                        }
-                    }
-                }
+                ULOG("set %s volume on '%s' to %d%%",
+                    isCaptureDevice ? "capture" : "playback", cardId, *setVolume);
+                ret = true;
             }
-        }
-
-        if (!isCaptureDevice && (hasCommonVolume || hasPlaybackVolume))
-        {
-            err = snd_mixer_selem_get_playback_volume_range(elem, &pmin, &pmax);
-            if (err == 0)
+            else
             {
-                printf("Playback volume range: [%ld, %ld]\n", pmin, pmax);
-                for (int n = 0; n <= 8; ++n)
-                {
-                    snd_mixer_selem_channel_id_t ch = (snd_mixer_selem_channel_id_t)n;
-                    const char* chName = snd_mixer_selem_channel_name(ch);
-                    if (snd_mixer_selem_has_playback_channel(elem, ch))
-                    {
-                        pvol = 0;
-                        isOn = 0;
-                        err = snd_mixer_selem_get_playback_volume(elem, ch, &pvol);
-                        err = snd_mixer_selem_get_playback_switch(elem, ch, &isOn);
-                        if (err == 0)
-                        {
-                            ppercent = (int)rint((pvol-pmin)*100.0/(pmax-pmin));
-                            printf("  %s, volume %ld(%d%%) %s\n",
-                                chName, pvol, ppercent, isOn ? "on" : "off");
-                        }
-                        if (getVolume)
-                        {
-                            *getVolume = ppercent;
-                            ret = true;
-                        }
-                        if (setVolume && (*setVolume) >= 0 && (*setVolume) <= 100)
-                        {
-                            pvol = pmin + (pmax-pmin) * (*setVolume) / 100;
-                            err = snd_mixer_selem_set_playback_volume(elem, ch, pvol);
-                            if (err == 0)
-                            {
-                                printf("  set volume to %d%%\n", *setVolume);
-                                ret = true;
-                            }
-                        }
-                    }
-                }
+                ULOG("set volume failed on '%s', error=%d(%s)", cardId, err, snd_strerror(err));
             }
         }
-	}
+        break; // first usable channel is enough
+    }
 
     snd_mixer_close(handle);
     return ret;
@@ -1158,7 +1433,8 @@ bool getOrSetVolume(const char* cardId, bool isCaptureDevice, int* getVolume, in
 int AlsaCaptureDevice::getVolume(const char* cardId)
 {
     int volume = 0;
-    getOrSetVolume(cardId, true, &volume, nullptr);
+    if (!getOrSetVolume(cardId, true, &volume, nullptr))
+        return -1;
     return volume;
 }
 
@@ -1170,28 +1446,24 @@ bool AlsaCaptureDevice::setVolume(const char* cardId, int volume)
 int AlsaPlaybackDevice::getVolume(const char* cardId)
 {
     if (cardId == nullptr || strcmp(cardId, "") == 0)
-    {
         return _volume;
-    }
-    else
-    {
-        int volume = 0;
-        getOrSetVolume(cardId, false, &volume, nullptr);
-        return volume;
-    }
+
+    int volume = 0;
+    if (!getOrSetVolume(cardId, false, &volume, nullptr))
+        return -1;
+    return volume;
 }
 
 bool AlsaPlaybackDevice::setVolume(const char* cardId, int volume)
 {
     if (cardId == nullptr || strcmp(cardId, "") == 0)
     {
-        if (volume >=0 && volume <= 100)
+        if (volume >= 0 && volume <= 100)
         {
             _volume = volume;
             return true;
         }
         return false;
     }
-    else
     return getOrSetVolume(cardId, false, nullptr, &volume);
 }

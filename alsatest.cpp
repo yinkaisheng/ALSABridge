@@ -10,7 +10,7 @@
 #define DEVICE_BUFFER_LEN 256
 
 typedef void(*AlsaEnumCallback)(int index, const char* name, const char* id, void* user);
-typedef void(*AlsaInputDataCallback)(uint32_t cachedSamples, char* data, uint32_t& samples, void* user);
+typedef void(*AlsaInputDataCallback)(uint32_t cachedSamples, char* data, uint32_t* samples, void* user);
 typedef void(*AlsaOutputDataCallback)(uint32_t cachedSamples, const char* data, uint32_t samples, void* user);
 
 DLL_EXPORT int enumerateAlsaCaptureDevices(AlsaEnumCallback callback, void* user);
@@ -710,7 +710,7 @@ void AlsaPlaybackDevice::handleData(int avail, char* buf, uint32_t sampleCount)
     {
         uint32_t gotSamples = sampleCount;
         uint32_t cachedSamples = PERIOD_COUNT*sampleCount - avail;
-        _inputCallback(cachedSamples, buf, gotSamples, _userData);
+        _inputCallback(cachedSamples, buf, &gotSamples, _userData);
         if (gotSamples == 0)
         {
             uint32_t cacheMs = cachedSamples * 1000 / _sampleRate;

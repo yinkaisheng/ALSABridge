@@ -345,9 +345,12 @@ def log(msg: Any = '', sep: str = ' ', end: Optional[str] = None, caller: bool =
 
 
 def set_console_title(title: str) -> None:
-    # need colorama.init
-    if sys.stdout:
-        sys.stdout.write(f'\x1b]2;{title}\x07')
+    try:
+        if sys.stdout and os.isatty(sys.stdout.fileno()):
+            sys.stdout.write(f'\x1b]2;{title}\x07')
+            sys.stdout.flush()
+    except Exception:
+        pass  # not running in a terminal (e.g. systemd service)
 
 
 if __name__ == '__main__':
