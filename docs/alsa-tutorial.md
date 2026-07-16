@@ -295,13 +295,15 @@ App → ALSA "pulse"/"default" → Pulse/PipeWire → 硬件
 
 ## 5. PCM 采播完整流程
 
-本项目采播路径与标准 ALSA 流程一致：
+PCM 状态大致为：`OPEN → SETUP → PREPARED → RUNNING → …`
 
 ```text
-open → (可选 set period) → set hw_params → prepare → start
+open → (可选 set period) → set hw_params → prepare → start（或 writei 自动 start）
   → 循环 readi/writei
   → drop 或 drain → close
 ```
+
+**采集与播放在本项目中的 `start` 行为不同**（见 [5.4](#54-播放-auto-start-与-start_threshold)）。
 
 ### 5.1 播放（Playback）
 
@@ -313,7 +315,7 @@ open → (可选 set period) → set hw_params → prepare → start
 
 - `period`：一次中断/处理的块大小
 - `buffer`：多个 period 组成的环形缓冲
-- underrun（欠载）：应用喂数据太慢，缓冲空了
+- underrun（欠载）：应用喂数据太慢，缓冲空了 → 常见错误 `-EPIPE`（Broken pipe）
 
 本项目用回调从 Python 拉数据，再在 C++ 里 `snd_pcm_writei`。
 
@@ -339,6 +341,57 @@ open → (可选 set period) → set hw_params → prepare → start
 
 调大 period：更稳、延迟更大。
 调小 period：延迟更低、更容易 underrun/overrun。
+
+### 5.4 播放 auto-start 与 start_threshold
+
+除 `hw_params` 外，ALSA 还有 **软件参数** `snd_pcm_sw_params`，其中 **`start_threshold`**（单位：帧）决定：
+
+> 播放时，ring buffer 里已写入的帧数 **≥ start_threshold** 且流尚未 RUNNING 时，**自动 start**（不必调用 `snd_pcm_start`）。
+
+| 来源 | 典型 `start_threshold` |
+|------|-------------------------|
+| alsa-lib 默认（只调 `hw_params`、未设 sw params） | **1**（写 1 帧就可能 auto-start） |
+| `aplay` 等工具 | 常设为整 buffer 大小 |
+| 希望只能手动 start | 设为 **> buffer_size** |
+
+本项目 **未显式设置** sw params，因此多为默认值 **1**。例如 16 kHz 下 1 帧 ≈ 62 µs；`start()` 后工作线程第一次成功 `writei` 一个 period，即可 auto-start。
+
+**读取当前值**（本项目在播放线程 `prepare` 后会打日志）：
+
+```c
+snd_pcm_sw_params_current(pcm, swparams);
+snd_pcm_sw_params_get_start_threshold(swparams, &start_threshold);
+snd_pcm_get_params(pcm, &buffer_size, &period_size);
+```
+
+### 5.5 本项目采播启动差异（重要）
+
+| 步骤 | 录音 `AlsaCaptureDevice` | 播放 `AlsaPlaybackDevice` |
+|------|--------------------------|---------------------------|
+| `start()` 主线程 | `prepare` + **`snd_pcm_start`** + 建工作线程 | **只建工作线程**，立即返回 |
+| 工作线程入口 | 直接 `wait` → `readi` | **`prepare`** → 读 sw params 日志 → `wait` → `writei` |
+| 进入 RUNNING | 显式 `snd_pcm_start` | **`writei` 达到 start_threshold 后 auto-start** |
+| `open` 模式 | `SND_PCM_ASYNC` | **阻塞模式**（I/O 在工作线程） |
+
+这样设计的原因：
+
+- 播放若在 **空缓冲** 上调用 `snd_pcm_start`，硬件立刻要数据而应用尚未 `writei`，易出现 **`snd_pcm_start error=-32 (EPIPE)`**。
+- 参考 miniaudio 等库：播放侧由工作线程 `prepare` + 预填 + `writei` 驱动；`start()` 对调用方非阻塞。
+- 录音侧数据来自硬件，显式 `start` 后再 `readi` 是常见且安全的做法。
+
+```text
+播放（本项目）:
+
+  主线程: start() ──► 创建 thread，立即返回
+  工作线程: prepare → writei × N → (auto-start) → 循环 writei
+
+录音（本项目）:
+
+  主线程: start() ──► prepare → snd_pcm_start → 创建 thread
+  工作线程: wait → readi → 回调
+```
+
+`writei` / `readi` 遇 xrun 时，本项目会调用 `snd_pcm_recover` 并继续（播放写路径会重试一次 `writei`）。
 
 ---
 
@@ -379,7 +432,7 @@ open → (可选 set period) → set hw_params → prepare → start
 | `snd_pcm_open` | 打开 PCM | `open`、`queryAlsaDeviceHwParams` |
 | `snd_pcm_close` | 关闭 PCM | `close`、query 结束 |
 | `SND_PCM_STREAM_PLAYBACK` / `CAPTURE` | 方向 | open / query |
-| `SND_PCM_ASYNC` | 异步模式标志 | 采播 `open` |
+| `SND_PCM_ASYNC` | 异步模式标志 | **仅录音** `open` |
 | `SND_PCM_NONBLOCK` | 非阻塞打开 | query / ctl |
 
 `deviceId` 可以是任意合法 PCM 名：`default`、`hw:...`、`plughw:...`、`pulse` 等。
@@ -405,6 +458,17 @@ open → (可选 set period) → set hw_params → prepare → start
 | `snd_pcm_hw_params_get_channels/rate/periods/period_time/period_size/buffer_size` | 读回缓冲布局 | `getParams` |
 | `snd_pcm_access_name` / `snd_pcm_state_name` / `snd_pcm_subformat_name` | 调试字符串 | `getParams` |
 
+### 6.4.1 软件参数 sw_params（播放 auto-start）
+
+| API | 作用 | 本项目 |
+|-----|------|--------|
+| `snd_pcm_sw_params_alloca` | 分配 sw 参数对象 | 播放线程日志 |
+| `snd_pcm_sw_params_current` | 读当前 sw 参数 | 播放 `run()` |
+| `snd_pcm_sw_params_get_start_threshold` | 自动 start 阈值（帧） | 播放 `run()` 日志 |
+| `snd_pcm_get_params` | 读 buffer/period 大小 | 播放 `run()` 日志 |
+| `snd_pcm_sw_params_set_start_threshold` | 设置 auto-start 阈值 | **未使用**（alsa-lib 默认） |
+| `snd_pcm_sw_params` | 提交 sw 参数 | **未使用** |
+
 常用格式常量（本项目）：
 
 - `SND_PCM_FORMAT_S8`
@@ -421,11 +485,12 @@ open → (可选 set period) → set hw_params → prepare → start
 
 | API | 作用 | 本项目 |
 |-----|------|--------|
-| `snd_pcm_prepare` | 进入准备状态 | `start` |
-| `snd_pcm_start` | 开始传输 | `start` |
+| `snd_pcm_prepare` | 进入准备状态 | 录音 `start`；**播放工作线程** `run()` |
+| `snd_pcm_start` | 开始传输 | **仅录音** `start` |
 | `snd_pcm_readi` | 交错读（录音） | capture `handleData` |
-| `snd_pcm_writei` | 交错写（播放） | playback `handleData` |
-| `snd_pcm_avail` / 相关 avail 查询 | 可读/可写帧数 | 线程循环 |
+| `snd_pcm_writei` | 交错写（播放）；可触发 auto-start | playback `handleData` |
+| `snd_pcm_wait` | 等待可读/可写 | 采播工作线程 `run()` |
+| `snd_pcm_avail_update` | 更新并返回 avail | 采播工作线程 `run()` |
 | `snd_pcm_delay` | 缓冲延迟（帧） | 播放侧 cache 时间 |
 | `snd_pcm_drop` | 立刻丢弃缓冲并停 | `stop` |
 | `snd_pcm_drain` | 播完缓冲再停 | `syncStop` / async 收尾 |
@@ -473,7 +538,13 @@ queryAlsaDeviceHwParams("hw:...", 0, ...)
         │
         ▼
 播放: AlsaPlaybackDevice.open/set_params/start
-  → snd_pcm_open / hw_params_* / prepare / start / writei
+  → snd_pcm_open(阻塞) / hw_params_*
+  → start: 仅建 thread
+  → thread: prepare / sw_params 日志 / wait / writei (auto-start)
+录音: AlsaCaptureDevice.open/set_params/start
+  → snd_pcm_open(ASYNC) / hw_params_*
+  → start: prepare + snd_pcm_start + thread
+  → thread: wait / readi
 ```
 
 常用命令对照：
@@ -495,6 +566,7 @@ queryAlsaDeviceHwParams("hw:...", 0, ...)
 
 | 现象 | 可能原因 | 处理 |
 |------|----------|------|
+| `snd_pcm_start error=-32 (EPIPE)` 播放 | 空缓冲上显式 `start` 导致立刻 underrun | 本项目已改为播放 thread 内 `prepare`+`writei` auto-start；勿在空缓冲 `start` |
 | `Invalid argument` at set_channels/rate | `hw:` 不支持该格式 | 换匹配格式，或改 `plughw:` |
 | `Device or resource busy` | 设备被占用（独占） | 关掉占用进程；或走 pulse/dsnoop |
 | `Unknown PCM default` | 未配置 default/pulse | 配 `~/.asoundrc` 或装 plugins |

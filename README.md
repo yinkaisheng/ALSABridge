@@ -206,22 +206,126 @@ AudioDevice(card_id="hw:4", device_name="USB Composite Device, USB Audio", devic
 
 ### 作为模块导入
 
+#### 通用约定
+
+- 生命周期顺序：**`open` →（可选 `set_period`）→ `set_params` → 注册回调 → `start` → `stop` → `close` → `release`**
+- 推荐用 **`with AlsaCaptureDevice() as dev:`** / **`with AlsaPlaybackDevice() as dev:`**；退出时自动 `close` + `release`
+- **`set_params` / `set_period` / 回调注册须在 `start()` 之前**；`start()` 之后不可再改
+- 回调在 **C++ 工作线程**执行，勿在回调里阻塞过久或调用 `stop()`（`async_stop` 的 `on_playback_stopped` 同理）
+
+#### 录音流程
+
+```python
+import wave
+from alsabridge import AlsaCaptureDevice, CaptureCallback, query_device_hw_params, mixer_card_from_hw_params
+
+class MyCapture(CaptureCallback):
+    def __init__(self, wav_path: str, rate: int, ch: int, bps: int):
+        self._wf = wave.open(wav_path, 'wb')
+        self._wf.setnchannels(ch)
+        self._wf.setsampwidth(bps // 8)
+        self._wf.setframerate(rate)
+
+    def on_capture_output_data(self, cache_time_ms: int, samples: bytes, samples_count: int) -> None:
+        # cache_time_ms: 驱动缓冲里尚未读走的音频时长（毫秒）
+        self._wf.writeframes(samples)
+
+    def close(self):
+        self._wf.close()
+
+device_id = 'hw:Device_1,0'   # 或 default / plughw:... / pulse
+rate, ch, bps = 16000, 1, 16
+
+cb = MyCapture('out.wav', rate, ch, bps)
+with AlsaCaptureDevice() as dev:
+    dev.set_capture_callback(cb)
+    if not dev.open(device_id):
+        raise RuntimeError('open failed')
+    dev.set_period(period_count=10, period_time=20)   # 可选；默认 10×20 ms
+    if not dev.set_params(rate, ch, bps):
+        raise RuntimeError('set_params failed')
+    # 可选：按设备卡设置 capture mixer 音量
+    hw = query_device_hw_params(device_id, is_capture=True)
+    card = mixer_card_from_hw_params(hw, device_id)
+    dev.set_volume(80, card_id=card)
+    if not dev.start():          # 内部 prepare + start + 建线程；之后 readi 循环
+        raise RuntimeError('start failed')
+    input('recording… press Enter to stop\n')
+    dev.stop()                   # 停止线程并 drop PCM
+cb.close()
+```
+
+#### 播放流程
+
+```python
+import wave
+from alsabridge import AlsaPlaybackDevice, PlaybackCallback
+
+class WavPlayback(PlaybackCallback):
+    def __init__(self, wav_path: str):
+        self._wf = wave.open(wav_path, 'rb')
+        self.rate = self._wf.getframerate()
+        self.ch = self._wf.getnchannels()
+        self.bps = self._wf.getsampwidth() * 8
+
+    def on_playback_input_data(self, cache_time_ms: int, samples_count: int) -> bytes:
+        # 返回 samples_count 帧 PCM；不足会自动补零；返回 b'' 表示无更多数据
+        return self._wf.readframes(samples_count)
+
+    def on_playback_stopped(self) -> None:
+        pass   # 仅 async_stop 完成后调用；勿在此调用 stop()
+
+    def close(self):
+        self._wf.close()
+
+device_id = 'hw:Device_1,0'
+cb = WavPlayback('in.wav')
+
+with AlsaPlaybackDevice() as dev:
+    dev.set_playback_callback(cb)
+    if not dev.open(device_id):
+        raise RuntimeError('open failed')
+    dev.set_min_cache_period_count(2)                 # 可选：缓冲过低时自动喂静音
+    dev.set_period(period_count=10, period_time=20)   # 可选
+    if not dev.set_params(cb.rate, cb.ch, cb.bps):
+        raise RuntimeError('set_params failed')
+    dev.set_volume(80)                                # 默认软件音量；card_id='hw:4' 改 mixer
+    if not dev.start():                               # 立即返回；工作线程 prepare + writei
+        raise RuntimeError('start failed')
+    input('playing… press Enter to stop\n')
+    dev.sync_stop()   # 播完缓冲再停；要立即停用 dev.stop()
+cb.close()
+```
+
+#### 播放停止方式
+
+| 方法 | 行为 |
+|------|------|
+| `stop()` | 立刻停止，丢弃 ALSA 内未播完的缓冲 |
+| `sync_stop()` | 阻塞直到缓冲播完 |
+| `async_stop()` | 立即返回；播完后在工作线程调用 `on_playback_stopped` |
+
+#### 枚举与硬件参数
+
 ```python
 from alsabridge import (
     get_capture_devices,
     get_playback_devices,
     query_device_hw_params,
-    AlsaCaptureDevice,
-    AlsaPlaybackDevice,
 )
 
-for dev in get_capture_devices():
+for dev in get_playback_devices():
     print(dev)
-    print(query_device_hw_params(dev.device_id, is_capture=True))
+    print(query_device_hw_params(dev.device_id, is_capture=False))
+```
 
-# Playback volume:
-#   set_volume(50)                 -> software gain (default)
-#   set_volume(50, card_id='hw:4') -> ALSA mixer on that card
-# Capture volume always uses mixer:
-#   set_volume(50, card_id='hw:2')
+音量：
+
+```python
+# 播放：默认软件增益（不改系统 mixer）
+dev.set_volume(50)
+dev.set_volume(50, card_id='hw:4')   # 改指定卡 ALSA mixer
+
+# 录音：仅 mixer（需传 card_id）
+dev.set_volume(50, card_id='hw:2')
 ```

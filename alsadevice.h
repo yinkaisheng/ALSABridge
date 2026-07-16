@@ -207,6 +207,7 @@ class AlsaCaptureDevice : public AlsaDevice
 public:
     virtual ~AlsaCaptureDevice();
     bool open(const char* deviceId) override;
+    bool start() override;
     bool stop() override;
     bool close() override;
     // Mixer volume only. cardId selects mixer card (e.g. "hw:0", "default").
@@ -252,6 +253,7 @@ public:
     bool setMinCachePeriodCount(uint32_t minCachePeriodCount);
     bool setInputCallback(AlsaInputDataCallback callback, void* user);
 protected:
+    void run() override;
     void threadStopped() override;
     void handleData(int64_t startTick, int avail, char* buf, uint32_t sampleCount) override;
 private:

@@ -600,8 +600,8 @@ bool AlsaPlaybackDevice::open(const char* deviceId)
     }
 
     ULOG("Open playback device '%s' by ALSA %s", deviceId, SND_LIB_VERSION_STR);
-    // 0 block, SND_PCM_NONBLOCK, SND_PCM_ASYNC
-    int err = snd_pcm_open(&_handle, deviceId, streamType, SND_PCM_ASYNC);
+    // 0 block, SND_PCM_NONBLOCK, SND_PCM_ASYNC; I/O runs on worker thread
+    int err = snd_pcm_open(&_handle, deviceId, streamType, 0);
     if (err < 0)
     {
         handleOpenError(deviceId, err);
@@ -749,18 +749,26 @@ bool AlsaDevice::start()
     if (_thread)
         return false;
 
-    int err = 0;
-    err = snd_pcm_prepare(_handle);
-    CHECK_ALSA_ERR_RET_FALSE(snd_pcm_prepare, err);
-
-    // can call snd_pcm_start or not call it
-    err = snd_pcm_start(_handle);
-    CHECK_ALSA_ERR_RET_FALSE(snd_pcm_start, err);
-
     _thread = new std::thread(threadFunc, this);
     ULOG("create thread %p", _thread);
 
     return true;
+}
+
+bool AlsaCaptureDevice::start()
+{
+    if (_handle == nullptr)
+        return false;
+    if (_thread)
+        return false;
+
+    int err = snd_pcm_prepare(_handle);
+    CHECK_ALSA_ERR_RET_FALSE(snd_pcm_prepare, err);
+
+    err = snd_pcm_start(_handle);
+    CHECK_ALSA_ERR_RET_FALSE(snd_pcm_start, err);
+
+    return AlsaDevice::start();
 }
 
 bool AlsaDevice::stop()
@@ -947,6 +955,46 @@ void AlsaDevice::threadStopped()
     ULOG("AlsaDevice %p, thread %p", this, _thread);
 }
 
+void AlsaPlaybackDevice::run()
+{
+    int err = snd_pcm_prepare(_handle);
+    if (err < 0)
+    {
+        ULOG("snd_pcm_prepare failed in playback thread, error=%d(%s)", err, snd_strerror(err));
+        return;
+    }
+
+    snd_pcm_sw_params_t* swParams;
+    snd_pcm_sw_params_alloca(&swParams);
+    err = snd_pcm_sw_params_current(_handle, swParams);
+    if (err >= 0)
+    {
+        snd_pcm_uframes_t startThreshold = 0;
+        snd_pcm_uframes_t bufferSize = 0;
+        snd_pcm_uframes_t periodSize = 0;
+        snd_pcm_sw_params_get_start_threshold(swParams, &startThreshold);
+        snd_pcm_get_params(_handle, &bufferSize, &periodSize);
+        if (_sampleRate > 0)
+        {
+            uint64_t thresholdUs = startThreshold * 1000000ULL / _sampleRate;
+            ULOG("playback sw params: sample_rate=%u, start_threshold=%lu frames (~%llu us), buffer_size=%lu, period_size=%lu",
+                _sampleRate, (unsigned long)startThreshold, (unsigned long long)thresholdUs,
+                (unsigned long)bufferSize, (unsigned long)periodSize);
+        }
+        else
+        {
+            ULOG("playback sw params: sample_rate=0 (setParams not called?), start_threshold=%lu frames, buffer_size=%lu, period_size=%lu",
+                (unsigned long)startThreshold, (unsigned long)bufferSize, (unsigned long)periodSize);
+        }
+    }
+    else
+    {
+        ULOG("snd_pcm_sw_params_current failed, error=%d(%s)", err, snd_strerror(err));
+    }
+
+    AlsaDevice::run();
+}
+
 void AlsaDevice::run()
 {
     int err = 0;
@@ -1068,11 +1116,10 @@ void AlsaPlaybackDevice::handleData(int64_t startTick, int avail, char* buffer, 
     uint32_t cacheMs = 0;
     if (_sampleRate > 0)
         cacheMs = cachedSamples * 1000 / _sampleRate;
-    if (cachedSamples >= _periodCount * sampleCount)
+    if (_totalHandledSamples > 0 && cachedSamples >= _periodCount * sampleCount)
     {
-        // buffer is enough
+        // buffer is enough; skip only after initial prefill
         sleepMSec(_periodTime);
-        //ULOG("sleep return, avail %d, cache %u ms", avail, cacheMs);
         return;
     }
 
@@ -1174,6 +1221,11 @@ void AlsaPlaybackDevice::handleData(int64_t startTick, int avail, char* buffer, 
             LOG_ALSA_ERR(snd_pcm_writei, (int)num);
             int err = snd_pcm_recover(_handle, (int)num, 1); // slient = 1
             CHECK_ALSA_ERR(snd_pcm_recover, err);
+            num = snd_pcm_writei(_handle, buffer, sampleCount);
+        }
+        if (num < 0)
+        {
+            LOG_ALSA_ERR(snd_pcm_writei, (int)num);
         }
         else
         {
