@@ -607,6 +607,10 @@ if __name__ == '__main__':
         '-v', '--volume', type=int, default=None,
         help='volume 0-100; playback: software gain (default); capture: mixer on device card',
     )
+    parser.add_argument(
+        '--prefill-ms', type=int, default=None,
+        help='playback only: prefill ms before auto-start; omit for auto (IOPLUG full buffer, HW low latency)',
+    )
 
     args = parser.parse_args()
 
@@ -618,6 +622,7 @@ if __name__ == '__main__':
     play_audio = args.play
     file_path = args.file
     volume = args.volume
+    prefill_ms = args.prefill_ms
 
     def _warn_ignored_capture_format_flags():
         ignored = []
@@ -630,11 +635,16 @@ if __name__ == '__main__':
         if ignored:
             log(f'warning: {" ".join(ignored)} ignored by --play (format is read from WAV)')
 
+    def _warn_ignored_playback_only_flags():
+        if prefill_ms is not None:
+            log(f'warning: --prefill-ms={prefill_ms} ignored by --capture')
+
     if list_input:
         _print_devices(get_capture_devices(), is_capture=True, verbose=verbose)
     if list_output:
         _print_devices(get_playback_devices(), is_capture=False, verbose=verbose)
     if capture_audio:
+        _warn_ignored_playback_only_flags()
         sample_rate = args.sample_rate if args.sample_rate is not None else 16000
         channels = args.channels if args.channels is not None else 2
         bits_per_sample = args.bits_per_sample if args.bits_per_sample is not None else 16
@@ -760,6 +770,12 @@ if __name__ == '__main__':
                 dev.set_period(period_count=10, period_time=20)
                 if not dev.set_params(sample_rate, channels, bits_per_sample):
                     parser.error('set_params failed')
+                if prefill_ms is not None:
+                    if prefill_ms < 0:
+                        parser.error('prefill-ms must be >= 0')
+                    print(f'set_prefill_ms {prefill_ms}')
+                    if not dev.set_prefill_ms(prefill_ms):
+                        parser.error('set_prefill_ms failed')
                 input(f'will play WAV {Fore.Cyan}{file_path}{Fore.Reset}, press {Fore.Cyan}Enter{Fore.Reset} to start:\n')
                 if not dev.start():
                     parser.error('start playback failed')

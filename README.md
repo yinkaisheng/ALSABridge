@@ -146,6 +146,9 @@ python3 alsabridge.py -p -f cap.wav
 python3 alsabridge.py -p -d "hw:Device_1,0" -f cap.wav
 python3 alsabridge.py -p -d "plughw:Device_1,0" -f cap.wav
 
+# hw 低延迟仍 underrun 时指定预填（省略 --prefill-ms 则走自动策略）
+python3 alsabridge.py -p -d "hw:Device_1,0" -f cap.wav --prefill-ms 100
+
 # WSL2 上指定 Pulse 设备播放（需先完成上文「WSL2 音频配置」）
 python3 alsabridge.py -d pulse -p -f cap.wav
 ```
@@ -185,6 +188,12 @@ AudioDevice(card_id="hw:4", device_name="USB Composite Device, USB Audio", devic
 | `-f` / `--file` | WAV 文件路径，默认 `cap.wav` |
 | `-v` / `--volume` | 音量 0–100。播放：默认软件增益（只影响本路 PCM，不改系统混音器）；录音：按 `-d` 解析到的声卡设置 ALSA mixer |
 | `--verbose` | 仅长选项；与 `-i` / `-o` 联用时查询并打印各设备解析结果与硬件参数（resolves/card/type/声道/采样率/格式） |
+
+仅 **播放**（`-p`）时有效：
+
+| 参数 | 含义 |
+|------|------|
+| `--prefill-ms` | 播放前预填毫秒数；省略则自动（IOPLUG 整 buffer，HW 低延迟）。`hw:` 仍 underrun 时可试 `100` |
 
 `hw:` 直连硬件，参数必须原生支持；格式不匹配时可改用 `plughw:`（ALSA 自动转换，略有开销）。
 
