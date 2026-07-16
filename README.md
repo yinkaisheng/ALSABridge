@@ -210,8 +210,9 @@ AudioDevice(card_id="hw:4", device_name="USB Composite Device, USB Audio", devic
 
 - 生命周期顺序：**`open` →（可选 `set_period`）→ `set_params` → 注册回调 → `start` → `stop` → `close` → `release`**
 - 推荐用 **`with AlsaCaptureDevice() as dev:`** / **`with AlsaPlaybackDevice() as dev:`**；退出时自动 `close` + `release`
-- **`set_params` / `set_period` / 回调注册须在 `start()` 之前**；`start()` 之后不可再改
+- **`set_params` / `set_period` / 回调注册 / `set_prefill_ms` 须在 `start()` 之前**；`start()` 之后不可再改
 - 回调在 **C++ 工作线程**执行，勿在回调里阻塞过久或调用 `stop()`（`async_stop` 的 `on_playback_stopped` 同理）
+- **`set_prefill_ms()`** 仅对当前一次 `open`…`close` 有效；`close()` 后清除，下次播放需重新决定是否调用
 
 #### 录音流程
 
@@ -290,6 +291,7 @@ with AlsaPlaybackDevice() as dev:
     if not dev.set_params(cb.rate, cb.ch, cb.bps):
         raise RuntimeError('set_params failed')
     dev.set_volume(80)                                # 默认软件音量；card_id='hw:4' 改 mixer
+    # 可选：hw 低延迟默认仍 underrun 时，可试 dev.set_prefill_ms(100)（IOPLUG/default 已整 buffer 预填，一般不必再设）
     if not dev.start():                               # 立即返回；工作线程 prepare + writei
         raise RuntimeError('start failed')
     input('playing… press Enter to stop\n')
@@ -304,6 +306,26 @@ cb.close()
 | `stop()` | 立刻停止，丢弃 ALSA 内未播完的缓冲 |
 | `sync_stop()` | 阻塞直到缓冲播完 |
 | `async_stop()` | 立即返回；播完后在工作线程调用 `on_playback_stopped` |
+
+#### 播放预填（`set_prefill_ms`）
+
+可选，须在 `start()` 前调用；**`close()` 后清除**，每次 `open` 后单独决定：
+
+| 调用 | 行为 |
+|------|------|
+| 不调用 | 自动：`IOPLUG`（如 `default`）整 buffer 预填（约 200 ms）；`HW` 低延迟 |
+| `set_prefill_ms(0)` | 强制低延迟（不预填，alsa 默认 `start_threshold`） |
+| `set_prefill_ms(100)` | 预填约 100 ms（不超过 buffer 容量） |
+
+**何时需要手动设置：** 主要是 **`hw:` / `plughw:` 等低延迟路径**仍 underrun 时，可逐步加大（如 80、100 ms）。`default`（IOPLUG）未调用时已整 buffer 预填，再设 `100` 反而会减小预填。
+
+```python
+with AlsaPlaybackDevice() as dev:
+    dev.open('hw:Device,0')   # 直连硬件；低延迟默认仍 xrun 时再调 prefill
+    dev.set_params(16000, 1, 16)
+    dev.set_prefill_ms(100)   # 仅本次 open；close 后需重设
+    dev.start()
+```
 
 #### 枚举与硬件参数
 

@@ -344,17 +344,36 @@ open → (可选 set period) → set hw_params → prepare → start（或 write
 
 ### 5.4 播放 auto-start 与 start_threshold
 
-除 `hw_params` 外，ALSA 还有 **软件参数** `snd_pcm_sw_params`，其中 **`start_threshold`**（单位：帧）决定：
+除 `hw_params` 外，ALSA 还有 **软件参数** `snd_pcm_sw_params`，其中 **`start_threshold`** 决定：
 
-> 播放时，ring buffer 里已写入的帧数 **≥ start_threshold** 且流尚未 RUNNING 时，**自动 start**（不必调用 `snd_pcm_start`）。
+> 播放时，ring buffer 里已写入的 **PCM 采样点数**（ALSA 称 **frame**：各声道在同一时刻的一组样本；**单声道时 1 frame = 1 个采样点**）**≥ start_threshold** 且流尚未 RUNNING 时，**自动 start**。
+
+与 **period**（约 20 ms 一块）不同：日志里的 `samples` 指 ALSA frame 计数，不是「一帧视频」也不是 period 块。
 
 | 来源 | 典型 `start_threshold` |
 |------|-------------------------|
-| alsa-lib 默认（只调 `hw_params`、未设 sw params） | **1**（写 1 帧就可能 auto-start） |
+| alsa-lib 默认（只调 `hw_params`、未设 sw params） | **1**（写 1 个 sample 就可能 auto-start） |
 | `aplay` 等工具 | 常设为整 buffer 大小 |
 | 希望只能手动 start | 设为 **> buffer_size** |
 
-本项目 **未显式设置** sw params，因此多为默认值 **1**。例如 16 kHz 下 1 帧 ≈ 62 µs；`start()` 后工作线程第一次成功 `writei` 一个 period，即可 auto-start。
+本项目在播放线程 **`prepare` 后** 决定预填策略：
+
+| 条件 | 策略 |
+|------|------|
+| **未调用** `setPrefillMs` + **HW** | 低延迟（默认 `start_threshold`，不预填） |
+| **未调用** + **IOPLUG** | 整 buffer 预填 + `start_threshold=buffer_size` |
+| **`setPrefillMs(0)`** | 强制低延迟（即使 IOPLUG） |
+| **`setPrefillMs(N)`**, N>0 | 预填约 N ms（帧数按采样率换算，不超过 buffer） |
+
+须在 **`start()` 之前**调用；**`close()` 后清除**，每次 `open`…`close` 单独决定（单次打开前记忆，不跨会话保留）。
+
+**何时手动设置：** 主要是 **HW / PLUG 低延迟路径**仍 underrun 时加大预填（如 80、100 ms）。**IOPLUG**（如 `default`）未调用时已整 buffer 预填（约 200 ms），一般不必再设；若设更小的 N 反而会减少预填。
+
+Python：`AlsaPlaybackDevice.set_prefill_ms(ms)`。C：`AlsaPlaybackDevice_setPrefillMs(handle, ms)`。
+
+`default` 只是 IOPLUG 的常见名字；自动策略读 **`snd_pcm_type()`**，不是设备名字符串。
+
+未改 sw params 时，alsa-lib 默认 `start_threshold` 多为 **1**（16 kHz 单声道下 1 sample ≈ 0.0625 ms）。
 
 **读取当前值**（本项目在播放线程 `prepare` 后会打日志）：
 
@@ -464,10 +483,11 @@ snd_pcm_get_params(pcm, &buffer_size, &period_size);
 |-----|------|--------|
 | `snd_pcm_sw_params_alloca` | 分配 sw 参数对象 | 播放线程日志 |
 | `snd_pcm_sw_params_current` | 读当前 sw 参数 | 播放 `run()` |
-| `snd_pcm_sw_params_get_start_threshold` | 自动 start 阈值（帧） | 播放 `run()` 日志 |
+| `snd_pcm_sw_params_get_start_threshold` | 自动 start 阈值（samples / ALSA frames） | 播放 `run()` 日志 |
 | `snd_pcm_get_params` | 读 buffer/period 大小 | 播放 `run()` 日志 |
-| `snd_pcm_sw_params_set_start_threshold` | 设置 auto-start 阈值 | **未使用**（alsa-lib 默认） |
-| `snd_pcm_sw_params` | 提交 sw 参数 | **未使用** |
+| `snd_pcm_sw_params_set_start_threshold` | 设置 auto-start 阈值 | 播放 `run()`（IOPLUG 自动或 `setPrefillMs`） |
+| `snd_pcm_sw_params` | 提交 sw 参数 | 播放 `run()` |
+| `snd_pcm_type` / `snd_pcm_type_name` | PCM 类型 HW/PLUG/IOPLUG… | 播放 `run()` 自动策略 |
 
 常用格式常量（本项目）：
 
@@ -566,7 +586,7 @@ queryAlsaDeviceHwParams("hw:...", 0, ...)
 
 | 现象 | 可能原因 | 处理 |
 |------|----------|------|
-| `snd_pcm_start error=-32 (EPIPE)` 播放 | 空缓冲上显式 `start` 导致立刻 underrun | 本项目已改为播放 thread 内 `prepare`+`writei` auto-start；勿在空缓冲 `start` |
+| `snd_pcm_start error=-32 (EPIPE)` 播放 | 空缓冲 `start` 或 `start_threshold` 过低（尤其 `default`/IOPLUG） | 本项目：thread 内 `prepare` + 预填 + `start_threshold=buffer`；直连硬件可用 `hw:`/`plughw:` |
 | `Invalid argument` at set_channels/rate | `hw:` 不支持该格式 | 换匹配格式，或改 `plughw:` |
 | `Device or resource busy` | 设备被占用（独占） | 关掉占用进程；或走 pulse/dsnoop |
 | `Unknown PCM default` | 未配置 default/pulse | 配 `~/.asoundrc` 或装 plugins |

@@ -128,6 +128,14 @@ DLL_EXPORT int AlsaCaptureDevice_captureToPcmFile(size_t handle, const char* pcm
 // @return                    1 on success, 0 on failure
 DLL_EXPORT int AlsaPlaybackDevice_setMinCachePeriodCount(size_t handle, uint32_t minCachePeriodCount);
 
+// Optional playback prefill before auto-start. Call after open/setParams, before start.
+// If not called before start, auto policy applies (IOPLUG: full buffer; HW: low latency).
+// prefillMs=0 forces low latency (no prefill, alsa default start_threshold).
+// prefillMs>0 prefill/start_threshold target in milliseconds (capped by buffer size).
+// Cleared on close(); each open cycle decides independently.
+// @return 1 on success, 0 on failure (e.g. already started)
+DLL_EXPORT int AlsaPlaybackDevice_setPrefillMs(size_t handle, uint32_t prefillMs);
+
 // Set playback feed callback (invoked from worker thread to pull PCM).
 // @param handle    playback device handle
 // @param callback  input data callback; may be null to clear
@@ -251,6 +259,8 @@ public:
     bool asyncStop(AlsaPlaybackStoppedCallback callback, void* user);
     // auto feed zero when cache count <= minCachePeriodCount
     bool setMinCachePeriodCount(uint32_t minCachePeriodCount);
+    // Optional prefill ms before start; must call before start. Cleared on close().
+    bool setPrefillMs(uint32_t prefillMs);
     bool setInputCallback(AlsaInputDataCallback callback, void* user);
 protected:
     void run() override;
@@ -265,6 +275,8 @@ private:
     AlsaPlaybackStoppedCallback _stopCallback{};
     void* _stopUserData{};
     std::atomic<bool> _paused{};
+    bool _prefillMsSet{};
+    uint32_t _prefillMs{};
 };
 
 

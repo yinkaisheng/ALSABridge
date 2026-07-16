@@ -108,6 +108,8 @@ class _AlsaDll:
 
         d.AlsaPlaybackDevice_setMinCachePeriodCount.argtypes = [c_size_t, c_uint32]
         d.AlsaPlaybackDevice_setMinCachePeriodCount.restype = c_int
+        d.AlsaPlaybackDevice_setPrefillMs.argtypes = [c_size_t, c_uint32]
+        d.AlsaPlaybackDevice_setPrefillMs.restype = c_int
         d.AlsaPlaybackDevice_setInputCallback.argtypes = [
             c_size_t, _alsa_input_data_callback, c_void_p]
         d.AlsaPlaybackDevice_setInputCallback.restype = c_int
@@ -401,6 +403,16 @@ class AlsaPlaybackDevice:
     def set_min_cache_period_count(self, min_cache_period_count: int = 2) -> bool:
         ret = _AlsaDll.instance().dll.AlsaPlaybackDevice_setMinCachePeriodCount(
             self._ptr, ctypes.c_uint32(min_cache_period_count))
+        return bool(ret)
+
+    def set_prefill_ms(self, prefill_ms: int) -> bool:
+        '''
+        Optional playback prefill before auto-start. Call after open/set_params, before start().
+        If not called, auto policy applies (IOPLUG: full buffer; HW: low latency).
+        prefill_ms=0 forces low latency. Cleared on close(); each open cycle decides independently.
+        '''
+        ret = _AlsaDll.instance().dll.AlsaPlaybackDevice_setPrefillMs(
+            self._ptr, ctypes.c_uint32(prefill_ms))
         return bool(ret)
 
     def set_period(self, period_count: int, period_time: int) -> bool:

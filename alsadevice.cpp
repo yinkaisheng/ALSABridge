@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstring>
 #include <cctype>
+#include <cerrno>
 #include <memory>
 #include <thread>
 #include <algorithm>
@@ -17,6 +18,27 @@
 
 int enumerateAlsaSoundcards(bool isCaptureDevice, AlsaEnumCallback callback, void* user);
 void pcmList(snd_pcm_stream_t stream);
+
+static bool playbackNeedsFullBufferStart(snd_pcm_type_t pcmType)
+{
+    // Only IOPLUG (e.g. ALSA "default" on embedded) needs full-buffer prefill.
+    // HW: direct low latency. PLUG (plughw:): usually fine with default threshold.
+    return pcmType == SND_PCM_TYPE_IOPLUG;
+}
+
+static snd_pcm_uframes_t msToFrames(uint32_t ms, uint32_t sampleRate)
+{
+    if (sampleRate == 0 || ms == 0)
+        return 0;
+    return (snd_pcm_uframes_t)((uint64_t)ms * sampleRate / 1000);
+}
+
+static snd_pcm_uframes_t alignDownToPeriod(snd_pcm_uframes_t frames, snd_pcm_uframes_t periodSize)
+{
+    if (periodSize == 0)
+        return frames;
+    return (frames / periodSize) * periodSize;
+}
 
 
 DLL_EXPORT int enumerateAlsaCaptureDevices(AlsaEnumCallback callback, void* user)
@@ -342,6 +364,14 @@ DLL_EXPORT int AlsaPlaybackDevice_setMinCachePeriodCount(size_t handle, uint32_t
     AlsaDevice* alsa = (AlsaDevice*)handle;
     AlsaPlaybackDevice* play = (AlsaPlaybackDevice*)alsa;
     return play->setMinCachePeriodCount(minCachePeriodCount);
+}
+
+DLL_EXPORT int AlsaPlaybackDevice_setPrefillMs(size_t handle, uint32_t prefillMs)
+{
+    REQUIRE_HANDLE(handle);
+    AlsaDevice* alsa = (AlsaDevice*)handle;
+    AlsaPlaybackDevice* play = (AlsaPlaybackDevice*)alsa;
+    return play->setPrefillMs(prefillMs);
 }
 
 DLL_EXPORT int AlsaPlaybackDevice_setInputCallback(size_t handle, AlsaInputDataCallback callback, void* user)
@@ -714,6 +744,16 @@ bool AlsaPlaybackDevice::setMinCachePeriodCount(uint32_t minPeriodCount)
     return true;
 }
 
+bool AlsaPlaybackDevice::setPrefillMs(uint32_t prefillMs)
+{
+    if (_thread)
+        return false;
+    _prefillMs = prefillMs;
+    _prefillMsSet = true;
+    ULOG("prefillMs=%u (single open cycle; cleared on close)", prefillMs);
+    return true;
+}
+
 bool AlsaPlaybackDevice::setInputCallback(AlsaInputDataCallback callback, void* user)
 {
     if (_thread)
@@ -929,6 +969,8 @@ bool AlsaPlaybackDevice::close()
 
     _minCachePeriodCount = FEED_ZERO_PERIOD_COUNT;
     _totalCapacitySamples = 0;
+    _prefillMsSet = false;
+    _prefillMs = 0;
     _inputCallback = nullptr;
     _userData = nullptr;
     _paused = false;
@@ -964,32 +1006,118 @@ void AlsaPlaybackDevice::run()
         return;
     }
 
+    snd_pcm_uframes_t bufferSize = 0;
+    snd_pcm_uframes_t periodSize = 0;
+    snd_pcm_get_params(_handle, &bufferSize, &periodSize);
+
     snd_pcm_sw_params_t* swParams;
     snd_pcm_sw_params_alloca(&swParams);
     err = snd_pcm_sw_params_current(_handle, swParams);
+    snd_pcm_uframes_t defaultStartThreshold = 0;
     if (err >= 0)
+        snd_pcm_sw_params_get_start_threshold(swParams, &defaultStartThreshold);
+
+    snd_pcm_type_t pcmType = snd_pcm_type(_handle);
+    const char* pcmTypeName = snd_pcm_type_name(pcmType);
+    const char* prefillPolicy = "auto:HW";
+    bool applySwParams = false;
+    bool doPrefill = false;
+    snd_pcm_uframes_t startThreshold = defaultStartThreshold;
+
+    if (_prefillMsSet)
     {
-        snd_pcm_uframes_t startThreshold = 0;
-        snd_pcm_uframes_t bufferSize = 0;
-        snd_pcm_uframes_t periodSize = 0;
-        snd_pcm_sw_params_get_start_threshold(swParams, &startThreshold);
-        snd_pcm_get_params(_handle, &bufferSize, &periodSize);
-        if (_sampleRate > 0)
+        if (_prefillMs == 0)
         {
-            uint64_t thresholdUs = startThreshold * 1000000ULL / _sampleRate;
-            ULOG("playback sw params: sample_rate=%u, start_threshold=%lu frames (~%llu us), buffer_size=%lu, period_size=%lu",
-                _sampleRate, (unsigned long)startThreshold, (unsigned long long)thresholdUs,
-                (unsigned long)bufferSize, (unsigned long)periodSize);
+            prefillPolicy = "override:0";
+            applySwParams = false;
+            doPrefill = false;
+            startThreshold = defaultStartThreshold;
         }
         else
         {
-            ULOG("playback sw params: sample_rate=0 (setParams not called?), start_threshold=%lu frames, buffer_size=%lu, period_size=%lu",
-                (unsigned long)startThreshold, (unsigned long)bufferSize, (unsigned long)periodSize);
+            startThreshold = msToFrames(_prefillMs, _sampleRate);
+            if (startThreshold == 0)
+                startThreshold = 1;
+            startThreshold = alignDownToPeriod(startThreshold, periodSize);
+            if (startThreshold == 0 && periodSize > 0)
+                startThreshold = periodSize;
+            if (startThreshold > bufferSize)
+                startThreshold = bufferSize;
+            char policyBuf[32];
+            snprintf(policyBuf, sizeof(policyBuf), "override:%ums", _prefillMs);
+            prefillPolicy = policyBuf;
+            applySwParams = true;
+            doPrefill = startThreshold > 0;
         }
     }
-    else
+    else if (playbackNeedsFullBufferStart(pcmType))
     {
-        ULOG("snd_pcm_sw_params_current failed, error=%d(%s)", err, snd_strerror(err));
+        prefillPolicy = "auto:IOPLUG";
+        startThreshold = periodSize > 0
+            ? (bufferSize / periodSize) * periodSize
+            : bufferSize;
+        if (startThreshold == 0)
+            startThreshold = bufferSize;
+        if (startThreshold > bufferSize)
+            startThreshold = bufferSize;
+        applySwParams = true;
+        doPrefill = true;
+    }
+
+    if (applySwParams && err >= 0)
+    {
+        err = snd_pcm_sw_params_set_start_threshold(_handle, swParams, startThreshold);
+        if (err >= 0)
+            err = snd_pcm_sw_params(_handle, swParams);
+    }
+    if (err < 0)
+    {
+        ULOG("snd_pcm_sw_params failed, error=%d(%s)", err, snd_strerror(err));
+    }
+    else if (_sampleRate > 0)
+    {
+        uint32_t thresholdMs = (uint32_t)(startThreshold * 1000 / _sampleRate);
+        uint32_t bufferMs = (uint32_t)(bufferSize * 1000 / _sampleRate);
+        uint32_t periodMs = (uint32_t)(periodSize * 1000 / _sampleRate);
+        ULOG("playback sw params: pcmType=%s, prefillPolicy=%s, prefillMsSet=%d, sample_rate=%u, "
+            "start_threshold=%lu samples (~%u ms, alsa default %lu samples), "
+            "buffer=%lu samples (~%u ms), period=%lu samples (~%u ms)",
+            pcmTypeName, prefillPolicy, _prefillMsSet ? 1 : 0, _sampleRate,
+            (unsigned long)startThreshold, thresholdMs, (unsigned long)defaultStartThreshold,
+            (unsigned long)bufferSize, bufferMs,
+            (unsigned long)periodSize, periodMs);
+    }
+
+    snd_pcm_sframes_t sampleCount = _periodTime * _sampleRate / 1000;
+    if (sampleCount <= 0)
+        sampleCount = 1;
+    std::unique_ptr<char> buffer{new char[(size_t)sampleCount * _channels * _bitsPerSample / 8]};
+    int64_t startTick = msecSinceStart();
+
+    if (doPrefill && bufferSize > 0)
+    {
+        _totalCapacitySamples = (uint32_t)bufferSize;
+
+        while (!_threadShouldExit && startThreshold > 0)
+        {
+            snd_pcm_sframes_t avail = snd_pcm_avail_update(_handle);
+            if (avail < 0)
+            {
+                ULOG("prefill snd_pcm_avail_update returns %ld(%s), call snd_pcm_recover",
+                    (long)avail, snd_strerror((int)avail));
+                err = snd_pcm_recover(_handle, (int)avail, 0);
+                if (err < 0)
+                    break;
+                continue;
+            }
+            if (avail < sampleCount)
+                break;
+            uint32_t cachedSamples = _totalCapacitySamples > (uint32_t)avail
+                ? _totalCapacitySamples - (uint32_t)avail : 0;
+            if (cachedSamples >= startThreshold)
+                break;
+            handleData(startTick, avail, buffer.get(), (uint32_t)sampleCount);
+        }
     }
 
     AlsaDevice::run();
@@ -1125,10 +1253,13 @@ void AlsaPlaybackDevice::handleData(int64_t startTick, int avail, char* buffer, 
 
     if (_inputCallback)
     {
-        snd_pcm_sframes_t delay = 0;
-        int err = snd_pcm_delay(_handle, &delay);
-        CHECK_ALSA_ERR(snd_pcm_delay, err);
-        cacheMs = delay * 1000 / _sampleRate;
+        if (snd_pcm_state(_handle) == SND_PCM_STATE_RUNNING)
+        {
+            snd_pcm_sframes_t delay = 0;
+            int err = snd_pcm_delay(_handle, &delay);
+            if (err >= 0 && _sampleRate > 0)
+                cacheMs = (uint32_t)(delay * 1000 / _sampleRate);
+        }
 
         uint32_t gotSamples = sampleCount;
         _inputCallback(cacheMs, buffer, &gotSamples, _userData);
