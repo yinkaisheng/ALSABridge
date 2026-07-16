@@ -188,12 +188,14 @@ AudioDevice(card_id="hw:4", device_name="USB Composite Device, USB Audio", devic
 | `-f` / `--file` | WAV 文件路径，默认 `cap.wav` |
 | `-v` / `--volume` | 音量 0–100。播放：默认软件增益（只影响本路 PCM，不改系统混音器）；录音：按 `-d` 解析到的声卡设置 ALSA mixer |
 | `--verbose` | 仅长选项；与 `-i` / `-o` 联用时查询并打印各设备解析结果与硬件参数（resolves/card/type/声道/采样率/格式） |
+| `-pt` / `--period-time` | period 时长（ms），采播共用，默认 20 |
+| `-ct` / `--cache-time` | 缓冲总时长（ms），换算为 period 个数，默认 200 |
 
 仅 **播放**（`-p`）时有效：
 
 | 参数 | 含义 |
 |------|------|
-| `--prefill-ms` | 播放前预填毫秒数；省略则自动（IOPLUG 整 buffer，HW 低延迟）。`hw:` 仍 underrun 时可试 `100` |
+| `-pm` / `--prefill-ms` | 播放前预填毫秒数；省略则自动（IOPLUG 整 buffer，HW 低延迟）。`hw:` 仍 underrun 时可试 `100` |
 
 `hw:` 直连硬件，参数必须原生支持；格式不匹配时可改用 `plughw:`（ALSA 自动转换，略有开销）。
 
@@ -211,7 +213,17 @@ AudioDevice(card_id="hw:4", device_name="USB Composite Device, USB Audio", devic
 |------|------|
 | `-s` / `--sample-rate` | 采样率，默认 16000 |
 | `-n` / `--channels` | 声道数，默认 2 |
-| `-b` / `--bits-per-sample` | 位深，默认 16 |
+| `-b` / `--bits-per-sample` | 位深（PCM 8/16/24/32），默认 16；与 C++ `set_params` 及 `WavWriter` 一致 |
+
+### PyQt5 演示（可选）
+
+依赖：`pip install PyQt5`（Linux 桌面 / WSLg 带 GUI 时可用）。
+
+```bash
+python3 pyqt5_demo.py
+```
+
+功能：选择采播设备、实时波形、WAV 播放/录音、播放时点击波形 **seek**（通过 `WavPlaybackImpl.seek_to_ratio()`）。
 
 ### 作为模块导入
 
@@ -222,6 +234,13 @@ AudioDevice(card_id="hw:4", device_name="USB Composite Device, USB Audio", devic
 - **`set_params` / `set_period` / 回调注册 / `set_prefill_ms` 须在 `start()` 之前**；`start()` 之后不可再改
 - 回调在 **C++ 工作线程**执行，勿在回调里阻塞过久或调用 `stop()`（`async_stop` 的 `on_playback_stopped` 同理）
 - **`set_prefill_ms()`** 仅对当前一次 `open`…`close` 有效；`close()` 后清除，下次播放需重新决定是否调用
+
+辅助类：
+
+| 类 | 用途 |
+|----|------|
+| `CaptureBufferCallback` | 录音写入 `bytearray` |
+| `WavPlaybackImpl` | WAV 播放回调；支持 `seek_to_ratio()`、`on_progress` |
 
 #### 录音流程
 

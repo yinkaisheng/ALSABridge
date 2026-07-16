@@ -99,6 +99,12 @@ void testPlayback(const char* deviceId, const char* pcmPath);
 void show_card_volume(const char* cardId);
 void getHints();
 
+static void printEnumDevice(int index, const char* card, const char* name, const char* id, void* user)
+{
+    const char* kind = user ? (const char*)user : "device";
+    printf("%s device:\n  card: %s\n  id  : %s\n  name: %s\n", kind, card, id, name);
+}
+
 
 int main(int argc, char* argv[])
 {
@@ -108,9 +114,9 @@ int main(int argc, char* argv[])
 	}
 
     printf("input devices:\n");
-    enumerateAlsaCaptureDevices(nullptr, nullptr);
+    enumerateAlsaCaptureDevices(printEnumDevice, (void*)"capture");
     printf("\noutput devices:\n");
-    enumerateAlsaPlaybackDevices(nullptr, nullptr);
+    enumerateAlsaPlaybackDevices(printEnumDevice, (void*)"playback");
 
     getHints();
 

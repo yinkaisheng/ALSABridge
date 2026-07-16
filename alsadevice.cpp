@@ -484,8 +484,6 @@ int enumerateAlsaSoundcards(bool isCaptureDevice, AlsaEnumCallback callback, voi
 
                         std::string name = ssname.str();
                         std::string id = ssid.str();
-                        printf("%s device:\n  card: %s\n  id  : %s\n  name: %s\n", 
-                            isCaptureDevice ? "capture" : "playback", hwname, id.c_str(), name.c_str());
                         if (callback)
                         {
                             callback(deviceCount, hwname, name.c_str(), id.c_str(), user);
@@ -583,7 +581,7 @@ AlsaCaptureDevice::~AlsaCaptureDevice()
 AlsaPlaybackDevice::AlsaPlaybackDevice()
     : _minCachePeriodCount(FEED_ZERO_PERIOD_COUNT)
 {
-    
+
 }
 AlsaPlaybackDevice::~AlsaPlaybackDevice()
 {
@@ -660,6 +658,8 @@ void AlsaDevice::handleOpenError(const char* deviceId, int err)
 
 bool AlsaDevice::setPeriod(uint32_t periodCount, uint32_t periodTime)
 {
+    ULOG("setPeriod periodCount=%u, periodTime=%u ms, sampleRate=%u", periodCount, periodTime, _sampleRate);
+
     if (_sampleRate)
         return false;
     _periodCount = periodCount;
@@ -971,6 +971,7 @@ bool AlsaPlaybackDevice::close()
     _totalCapacitySamples = 0;
     _prefillMsSet = false;
     _prefillMs = 0;
+    _lastLogTick = 0;
     _inputCallback = nullptr;
     _userData = nullptr;
     _paused = false;
@@ -999,6 +1000,7 @@ void AlsaDevice::threadStopped()
 
 void AlsaPlaybackDevice::run()
 {
+    _lastLogTick = 0;
     int err = snd_pcm_prepare(_handle);
     if (err < 0)
     {
@@ -1227,15 +1229,27 @@ void AlsaPlaybackDevice::handleData(int64_t startTick, int avail, char* buffer, 
         sleepMSec(5);
         return;
     }
-    if (_totalCapacitySamples == 0)
+
+    const bool firstCapacity = (_totalCapacitySamples == 0);
+    if (firstCapacity)
     {
         // internal buffer is double of _periodCount
         _totalCapacitySamples = ((avail - 1) / sampleCount + 1) * sampleCount;
-        ULOG("first avail %d, alsa internal total buffer %u ms", avail, _totalCapacitySamples * 1000 / _sampleRate);
+        _lastLogTick = 0;
         //_totalCapacitySamples = sampleCount * _periodCount;
     }
     if (avail < 0)
         avail = _totalCapacitySamples;   // likely underrun
+
+    int availMs = 0;
+    if (_sampleRate > 0)
+        availMs = (int)((int64_t)avail * 1000 / _sampleRate);
+
+    if (firstCapacity)
+    {
+        ULOG("first avail %d(%dms), alsa internal total buffer %u ms",
+             avail, availMs, _totalCapacitySamples * 1000 / _sampleRate);
+    }
     /*else if (avail >= _totalCapacitySamples)
     {
         avail -= _totalCapacitySamples;
@@ -1244,33 +1258,50 @@ void AlsaPlaybackDevice::handleData(int64_t startTick, int avail, char* buffer, 
     uint32_t cacheMs = 0;
     if (_sampleRate > 0)
         cacheMs = cachedSamples * 1000 / _sampleRate;
-    if (_totalHandledSamples > 0 && cachedSamples >= _periodCount * sampleCount)
+    if (_totalHandledSamples > 0 && cacheMs >= _periodCount * _periodTime)
     {
         // buffer is enough; skip only after initial prefill
         sleepMSec(_periodTime);
+        VLOG("sleep return, avail %d(%dms), cache %u ms", avail, availMs, cacheMs);
         return;
     }
 
     if (_inputCallback)
     {
-        if (snd_pcm_state(_handle) == SND_PCM_STATE_RUNNING)
-        {
-            snd_pcm_sframes_t delay = 0;
-            int err = snd_pcm_delay(_handle, &delay);
-            if (err >= 0 && _sampleRate > 0)
-                cacheMs = (uint32_t)(delay * 1000 / _sampleRate);
-        }
+        // if (snd_pcm_state(_handle) == SND_PCM_STATE_RUNNING)
+        // {
+        //     snd_pcm_sframes_t delay = 0;
+        //     int err = snd_pcm_delay(_handle, &delay);
+        //     if (err >= 0 && _sampleRate > 0)
+        //         cacheMs = (uint32_t)(delay * 1000 / _sampleRate); # not accurate in WSL2
+        // }
 
         uint32_t gotSamples = sampleCount;
+        int64_t cbStart = msecSinceStart();
         _inputCallback(cacheMs, buffer, &gotSamples, _userData);
+        int64_t cbNow = msecSinceStart();
+        int64_t cbCost = cbNow - cbStart;
+
         if (gotSamples > sampleCount)
             gotSamples = sampleCount;
+
         if (gotSamples < sampleCount)
         {
             size_t frameBytes = (size_t)_channels * _bitsPerSample / 8;
             memset(buffer + gotSamples * frameBytes, 0, (sampleCount - gotSamples) * frameBytes);
         }
+
         _totalHandledSamples += gotSamples;
+
+        if (_lastLogTick == 0 || cbNow - _lastLogTick >= 1000)
+        {
+            ULOG("p callback cost %lld ms, got %u(%ums) samples, cache %u ms before callback, avail %d(%dms), elapse %lld ms, write total %u ms",
+                 cbCost, gotSamples, _sampleRate > 0 ? gotSamples * 1000 / _sampleRate : 0,
+                 cacheMs, avail, availMs, cbNow - startTick,
+                 _sampleRate > 0 ? _totalHandledSamples * 1000 / _sampleRate : 0);
+            _lastLogTick = cbNow;
+        }
+
         //ULOG("write total %u ms", _totalHandledSamples*1000/_sampleRate);
         if (gotSamples == 0)
         {
@@ -1279,13 +1310,13 @@ void AlsaPlaybackDevice::handleData(int64_t startTick, int avail, char* buffer, 
             {
                 gotSamples = sampleCount;
                 memset(buffer, 0, gotSamples * _channels * _bitsPerSample / 8);
-                VLOG("callback doesn't feed data, avail %d, cache %u ms, fill %u ms 0 data, elapse %lld ms", 
-                    avail, cacheMs, _periodTime, msecSinceStart() - startTick);
+                VLOG("callback doesn't feed data, avail %d(%dms), cache %u ms, fill %u ms 0 data, elapse %lld ms",
+                     avail, availMs, cacheMs, _periodTime, msecSinceStart() - startTick);
             }
             else
             {
-                VLOG("callback doesn't feed data, avail %d, cache %u ms, sleep %d ms, elapse %lld ms", 
-                    avail, cacheMs, _periodTime/4, msecSinceStart() - startTick);
+                VLOG("callback doesn't feed data, avail %d(%dms), cache %u ms, sleep %d ms, elapse %lld ms",
+                    avail, availMs, cacheMs, _periodTime/4, msecSinceStart() - startTick);
                 sleepMSec(_periodTime / 4);
             }
         }
@@ -1338,7 +1369,7 @@ void AlsaPlaybackDevice::handleData(int64_t startTick, int avail, char* buffer, 
     else
     {
         _totalHandledSamples += sampleCount;
-        VLOG("_inputCallback is null, avail %d, fill 0, cache %u ms", avail, cacheMs);
+        VLOG("_inputCallback is null, avail %d(%dms), fill 0, cache %u ms", avail, availMs, cacheMs);
         memset(buffer, 0, sampleCount * _channels * _bitsPerSample / 8);
     }
 
@@ -1362,20 +1393,20 @@ void AlsaPlaybackDevice::handleData(int64_t startTick, int avail, char* buffer, 
         {
             if (num < sampleCount)
             {
-                ULOG("!!Avail %d, did not write all samples %ld/%ld, cache %u ms, cost %lld ms, elapse %lld ms",
-                    avail, num, sampleCount, cacheMs, cost, msecSinceStart() - startTick);
+                ULOG("!!Avail %d(%dms), did not write all samples %ld/%ld, cache %u ms, cost %lld ms, elapse %lld ms",
+                     avail, availMs, num, sampleCount, cacheMs, cost, msecSinceStart() - startTick);
             }
             else
             {
                 if (cacheMs == 0)
                 {
-                    VLOG("Avail %d, write samples %ld, cache %u ms, cost %lld ms, elapse %lld ms", 
-                        avail, num, cacheMs, cost, msecSinceStart() - startTick);
+                    VLOG("Avail %d(%dms), write samples %ld, cache %u ms, cost %lld ms, elapse %lld ms",
+                         avail, availMs, num, cacheMs, cost, msecSinceStart() - startTick);
                 }
                 else
                 {
-                    VLOG("Avail %d, write samples: %ld, cache %u ms, cost %lld ms, elapse %lld ms", 
-                        avail, num, cacheMs, cost, msecSinceStart() - startTick);
+                    VLOG("Avail %d(%dms), write samples: %ld, cache %u ms, cost %lld ms, elapse %lld ms",
+                         avail, availMs, num, cacheMs, cost, msecSinceStart() - startTick);
                 }
             }
         }

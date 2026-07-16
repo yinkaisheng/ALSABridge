@@ -231,8 +231,12 @@ def get_playback_devices() -> List[AudioDevice]:
 
 
 def _print_devices(devices: List[AudioDevice], is_capture: bool, verbose: bool) -> None:
+    kind = 'capture' if is_capture else 'playback'
     for dev in devices:
-        print(dev)
+        print(f'{kind} device:')
+        print(f'  card: {dev.card_id}')
+        print(f'  id  : {dev.device_id}')
+        print(f'  name: {dev.device_name}')
         if not verbose:
             continue
         hw = query_device_hw_params(dev.device_id, is_capture=is_capture)
@@ -245,6 +249,20 @@ class CaptureCallback:
     def on_capture_output_data(self, cache_time_ms: int, samples: bytes, samples_count: int) -> None:
         '''runs in another thread'''
         pass
+
+
+class CaptureBufferCallback(CaptureCallback):
+    """Capture audio into a bytearray buffer.
+
+    Pass ``buffer`` (a ``bytearray``) and use ``buffer`` after capture stops.
+    """
+
+    def __init__(self, buffer: bytearray):
+        super().__init__()
+        self.buffer = buffer
+
+    def on_capture_output_data(self, cache_time_ms: int, samples: bytes, samples_count: int) -> None:
+        self.buffer.extend(samples)
 
 
 class AlsaCaptureDevice:
@@ -523,7 +541,12 @@ def _sampwidth_bytes(bits_per_sample: int) -> int:
         return 1
     if bits_per_sample == 16:
         return 2
-    raise ValueError(f'wave module supports 8/16-bit PCM only, got {bits_per_sample} bit')
+    if bits_per_sample == 24:
+        return 3
+    if bits_per_sample == 32:
+        return 4
+    raise ValueError(
+        f'unsupported PCM bit depth {bits_per_sample}; use 8, 16, 24, or 32')
 
 
 def read_wav_params(path: str) -> Tuple[int, int, int]:
@@ -564,6 +587,11 @@ class WavReader:
     def read_frames(self, nframes: int) -> bytes:
         return self._wf.readframes(nframes)
 
+    def seek_frames(self, frame_index: int) -> None:
+        '''Seek to *frame_index* (0-based) so the next read_frames starts there.'''
+        if self._wf:
+            self._wf.setpos(max(0, frame_index))
+
     def close(self) -> None:
         wf = getattr(self, '_wf', None)
         if wf is not None:
@@ -572,6 +600,65 @@ class WavReader:
 
     def __del__(self):
         self.close()
+
+
+class WavPlaybackImpl(PlaybackCallback):
+    """Reusable WAV playback callback for AlsaPlaybackDevice.
+
+    Mirrors the flow in ``python3 alsabridge.py --play``.
+    """
+
+    def __init__(self, reader: WavReader, wav_path: str = '',
+                 on_progress=None):
+        """
+        Args:
+            reader: an open WavReader
+            wav_path: path to the WAV file (used to compute total_frames for progress)
+            on_progress: optional callable ``(ratio: float)`` called after each chunk
+        """
+        self._reader = reader
+        self.sample_rate = reader.sample_rate
+        self.channels = reader.channels
+        self.bits_per_sample = reader.bits_per_sample
+        self.should_stop_event = threading.Event()
+        self.stopped_event = threading.Event()
+        self.commit_samples = 0
+        self.total_frames = 0
+        self._on_progress = on_progress
+        self._seek_target = -1  # -1 = no pending seek
+
+        if wav_path:
+            with wave.open(wav_path, 'rb') as wf:
+                self.total_frames = wf.getnframes()
+
+    def close(self):
+        self._reader.close()
+
+    def __del__(self):
+        self.close()
+
+    def seek_to_ratio(self, ratio: float) -> None:
+        '''Request seek to *ratio* (0.0–1.0). Applied in the next callback.'''
+        if self.total_frames > 0:
+            self._seek_target = int(max(0.0, min(1.0, ratio)) * self.total_frames)
+
+    def on_playback_input_data(self, cache_time_ms: int, samples_count: int) -> bytes:
+        # Apply pending seek (safe: only read/written from ALSA thread after set)
+        if self._seek_target >= 0:
+            self._reader.seek_frames(self._seek_target)
+            self.commit_samples = self._seek_target
+            self._seek_target = -1
+        ret = self._reader.read_frames(samples_count)
+        frame_bytes = self.channels * self.bits_per_sample // 8
+        self.commit_samples += len(ret) // frame_bytes
+        if self.total_frames > 0 and self._on_progress:
+            self._on_progress(min(self.commit_samples / self.total_frames, 1.0))
+        if not ret:
+            self.should_stop_event.set()
+        return ret
+
+    def on_playback_stopped(self) -> None:
+        self.stopped_event.set()
 
 
 if __name__ == '__main__':
@@ -608,8 +695,16 @@ if __name__ == '__main__':
         help='volume 0-100; playback: software gain (default); capture: mixer on device card',
     )
     parser.add_argument(
-        '--prefill-ms', type=int, default=None,
+        '-pm', '--prefill-ms', type=int, default=None,
         help='playback only: prefill ms before auto-start; omit for auto (IOPLUG full buffer, HW low latency)',
+    )
+    parser.add_argument(
+        '-pt', '--period-time', type=int, default=20,
+        help='period time in ms for capture and playback',
+    )
+    parser.add_argument(
+        '-ct', '--cache-time', type=int, default=200,
+        help='cache time in ms for capture and playback',
     )
 
     args = parser.parse_args()
@@ -623,6 +718,12 @@ if __name__ == '__main__':
     file_path = args.file
     volume = args.volume
     prefill_ms = args.prefill_ms
+    period_time = args.period_time
+    if period_time <= 0:
+        parser.error('period-time must be > 0')
+    if args.cache_time <= 0:
+        parser.error('cache-time must be > 0')
+    period_count = max(2, (args.cache_time + period_time - 1) // period_time)
 
     def _warn_ignored_capture_format_flags():
         ignored = []
@@ -648,6 +749,10 @@ if __name__ == '__main__':
         sample_rate = args.sample_rate if args.sample_rate is not None else 16000
         channels = args.channels if args.channels is not None else 2
         bits_per_sample = args.bits_per_sample if args.bits_per_sample is not None else 16
+        try:
+            _sampwidth_bytes(bits_per_sample)
+        except ValueError as e:
+            parser.error(str(e))
 
         class CaptureCallbackImpl(CaptureCallback):
             def __init__(self, wav_path: str, sample_rate: int, channels: int, bits_per_sample: int):
@@ -689,7 +794,7 @@ if __name__ == '__main__':
                     print(f'set_volume {volume} on mixer card {card}')
                     if not dev.set_volume(volume, card_id=card):
                         parser.error(f'set_volume failed on mixer card {card}')
-                dev.set_period(period_count=10, period_time=20)
+                dev.set_period(period_count=period_count, period_time=period_time)
                 if not dev.set_params(sample_rate, channels, bits_per_sample):
                     parser.error('set_params failed')
                 input(f'will capture to WAV {Fore.Cyan}{file_path}{Fore.Reset}, press {Fore.Cyan}Enter{Fore.Reset} to start:')
@@ -714,42 +819,17 @@ if __name__ == '__main__':
             f'({Fore.Cyan}{file_path}{Fore.Reset})'
         )
 
-        class WavPlaybackImpl(PlaybackCallback):
-            def __init__(self, reader: WavReader):
-                self._reader = reader
-                self.sample_rate = reader.sample_rate
-                self.channels = reader.channels
-                self.bits_per_sample = reader.bits_per_sample
-                self.should_stop_event = threading.Event()
-                self.stopped_event = threading.Event()
-                self.commit_samples = 0
-                self.play_time = 0
+        last_play_time = [0]
 
-            def close(self):
-                self._reader.close()
-
-            def __del__(self):
-                self.close()
-
-            def on_playback_input_data(self, cache_time_ms: int, samples_count: int) -> bytes:
-                ret = self._reader.read_frames(samples_count)
-                frame_bytes = self.channels * self.bits_per_sample // 8
-                self.commit_samples += len(ret) // frame_bytes
-                play_time = self.commit_samples // self.sample_rate
-                if play_time != self.play_time:
+        def _on_progress(ratio):
+            if wav_reader.sample_rate > 0 and playback_callback.total_frames > 0:
+                play_time = int(
+                    ratio * playback_callback.total_frames / wav_reader.sample_rate)
+                if play_time != last_play_time[0]:
                     print(f'play time: {Fore.Cyan}{play_time}{Fore.Reset}')
-                    self.play_time = play_time
-                if not ret:
-                    self.should_stop_event.set()
-                return ret
+                    last_play_time[0] = play_time
 
-            def on_playback_stopped(self) -> None:
-                if self.sample_rate > 0:
-                    total_time = self.commit_samples / self.sample_rate
-                    print(f'total time: {Fore.Cyan}{total_time:.3f}{Fore.Reset}')
-                self.stopped_event.set()
-
-        playback_callback = WavPlaybackImpl(wav_reader)
+        playback_callback = WavPlaybackImpl(wav_reader, file_path, _on_progress)
         started = False
         with AlsaPlaybackDevice() as dev:
             try:
@@ -767,7 +847,7 @@ if __name__ == '__main__':
                     if not dev.set_volume(volume):
                         parser.error('set_volume failed')
                 dev.set_min_cache_period_count(2)
-                dev.set_period(period_count=10, period_time=20)
+                dev.set_period(period_count=period_count, period_time=period_time)
                 if not dev.set_params(sample_rate, channels, bits_per_sample):
                     parser.error('set_params failed')
                 if prefill_ms is not None:
@@ -784,6 +864,9 @@ if __name__ == '__main__':
                 playback_callback.should_stop_event.wait()
                 dev.async_stop()
                 playback_callback.stopped_event.wait()
+                if playback_callback.sample_rate > 0:
+                    total_time = playback_callback.commit_samples / playback_callback.sample_rate
+                    print(f'total time: {Fore.Cyan}{total_time:.3f}{Fore.Reset}')
             finally:
                 if started:
                     dev.stop()

@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+
+# Native build artifacts
+*.o
+libalsadevice.so
+
+# Local test captures / generated WAV
+*.wav

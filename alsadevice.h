@@ -21,7 +21,7 @@ typedef void(*AlsaOutputDataCallback)(uint32_t cacheTimeMs, const char* data, ui
 // Called when asyncStop finishes draining cached playback. Do not call stop() inside this callback.
 typedef void(*AlsaPlaybackStoppedCallback)(void* user);
 
-// Enumerate capture devices. callback may be null (still prints to stdout).
+// Enumerate capture devices. callback may be null (count-only, no per-device notification).
 // @param callback  per-device callback; user forwarded unchanged
 // @param user      opaque user pointer for callback
 // @return          number of hardware devices found (excludes Python-side "default")
@@ -277,6 +277,7 @@ private:
     std::atomic<bool> _paused{};
     bool _prefillMsSet{};
     uint32_t _prefillMs{};
+    int64_t _lastLogTick{};
 };
 
 
