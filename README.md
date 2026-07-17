@@ -240,7 +240,7 @@ python3 pyqt5_demo.py
 | 类 | 用途 |
 |----|------|
 | `CaptureBufferCallback` | 录音写入 `bytearray` |
-| `WavPlaybackImpl` | WAV 播放回调；支持 `seek_to_ratio()`、`on_progress` |
+| `WavPlaybackImpl` | WAV 播放回调；支持 `seek_to_ratio()`、`on_progress`（按 ALSA 缓冲估算实际听到的进度） |
 
 #### 录音流程
 
@@ -379,3 +379,19 @@ dev.set_volume(50, card_id='hw:4')   # 改指定卡 ALSA mixer
 # 录音：仅 mixer（需传 card_id）
 dev.set_volume(50, card_id='hw:2')
 ```
+
+## pyminiaudio 对比演示（可选）
+
+本项目也提供了一个 `pyminiaudio` 版本的演示脚本，方便和 ALSABridge 的 ALSA 直连实现做对比。
+
+依赖：`pip install miniaudio numpy`（Python 3.10+）。
+
+```bash
+python3 miniaudio_demo.py -l
+python3 miniaudio_demo.py -p -f cap.wav
+python3 miniaudio_demo.py -c -f capture.wav -s 16000 -n 1
+```
+
+教程：[docs/pyminiaudio_tutorial.md](docs/pyminiaudio_tutorial.md)。
+
+与 ALSABridge 对照：pyminiaudio 多脚本共享播放通常走默认设备或 Pulse；`-o` 列出的 `hw:...` 是硬件 PCM，共享场景用 `-d default` / `-d pulse`（见 [docs/alsa-tutorial.md](docs/alsa-tutorial.md) §4）。

@@ -614,7 +614,9 @@ class WavPlaybackImpl(PlaybackCallback):
         Args:
             reader: an open WavReader
             wav_path: path to the WAV file (used to compute total_frames for progress)
-            on_progress: optional callable ``(ratio: float)`` called after each chunk
+            on_progress: optional callable ``(ratio: float)`` called after each chunk.
+                The ratio estimates audible progress, subtracting buffered audio
+                that ALSA has not played yet.
         """
         self._reader = reader
         self.sample_rate = reader.sample_rate
@@ -650,9 +652,13 @@ class WavPlaybackImpl(PlaybackCallback):
             self._seek_target = -1
         ret = self._reader.read_frames(samples_count)
         frame_bytes = self.channels * self.bits_per_sample // 8
-        self.commit_samples += len(ret) // frame_bytes
+        got_frames = len(ret) // frame_bytes
+        self.commit_samples += got_frames
         if self.total_frames > 0 and self._on_progress:
-            self._on_progress(min(self.commit_samples / self.total_frames, 1.0))
+            cache_frames = max(0, int(cache_time_ms * self.sample_rate / 1000))
+            audible_frames = self.commit_samples - cache_frames - got_frames
+            audible_frames = max(0, min(audible_frames, self.total_frames))
+            self._on_progress(audible_frames / self.total_frames)
         if not ret:
             self.should_stop_event.set()
         return ret
